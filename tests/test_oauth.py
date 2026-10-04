@@ -131,6 +131,22 @@ def tools_list(client, token=None):
     return result["result"]["tools"], headers
 
 
+@pytest.mark.parametrize("listener", ["lan", "external"])
+def test_all_exposed_tools_have_explicit_boolean_annotations(apps, listener):
+    lan, public, _ = apps
+    client = lan if listener == "lan" else public
+    tools, _ = tools_list(client, None if listener == "lan" else "test-only-legacy-token")
+    assert tools
+    for tool in tools:
+        hints = tool["annotations"]
+        for name in ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"):
+            assert name in hints and type(hints[name]) is bool, (tool["name"], name)
+        assert hints["readOnlyHint"] is True
+        assert hints["destructiveHint"] is False
+        assert hints["idempotentHint"] is True
+        assert hints["openWorldHint"] is (tool["name"] != "current_time")
+
+
 def test_lan_without_auth_and_external_requires_auth(apps):
     lan, public, _ = apps
     assert "result" in rpc_response(initialize(lan))

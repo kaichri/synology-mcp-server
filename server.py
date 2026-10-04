@@ -559,7 +559,7 @@ def _remote_transcript_failed(text: str) -> bool:
 # TIME
 # ============================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 def current_time() -> str:
     return datetime.now().astimezone().isoformat()
 
@@ -573,7 +573,7 @@ def _exa_router():
     return ExaRouter(config, RemoteExaMcpProvider(call_exa, config.key))
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def web_search(
     query: str,
     num_results: int = 5
@@ -586,7 +586,7 @@ async def web_search(
         return json.dumps({"error": error.as_dict()})
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def web_fetch(
     url: str
 ) -> str:
@@ -601,7 +601,7 @@ async def web_fetch(
         return json.dumps({"error": error.as_dict()})
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def web_deep_search(query: str) -> str:
     """Explicit iterative Exa research with grounded synthesis; requires Direct API access."""
     try:
@@ -612,7 +612,7 @@ async def web_deep_search(query: str) -> str:
         return json.dumps({"error": error.as_dict()})
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def web_search_and_fetch(query: str, num_results: int = 10, fetch_top: int = 5) -> str:
     """Search, then batch-read up to five ranked URLs; return bounded structured JSON."""
     try:
@@ -1000,7 +1000,7 @@ async def _fetch_news_candidate_direct(url: str, interest: dict) -> dict | None:
         return None
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def finance_news_candidates(
     interests_json: str,
     max_candidates: int = 6,
@@ -1237,7 +1237,7 @@ async def finance_news_candidates(
 # YOUTUBE - METADATA
 # ============================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 def youtube_metadata(url: str) -> str:
     """Get detailed YouTube metadata without downloading the video."""
 
@@ -1318,7 +1318,7 @@ def youtube_metadata(url: str) -> str:
 # YOUTUBE - TRANSCRIPT
 # ============================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def youtube_transcript(
     url: str,
     languages: str = "de,en"
@@ -1425,7 +1425,7 @@ async def youtube_transcript(
 # YOUTUBE - COMMENTS
 # ============================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 def youtube_comments(
     url: str,
     limit: int = 20,
@@ -1540,7 +1540,7 @@ def youtube_comments(
 # SERVER START: separate LAN and authenticated external listeners
 # ============================================================
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def x_read_post(url: str, refresh: bool = False) -> dict:
     """Read an anonymous public X/Twitter post; report partial text and missing metadata.
 
@@ -1550,7 +1550,7 @@ async def x_read_post(url: str, refresh: bool = False) -> dict:
     return await call_provider("read_post", url=url, refresh=refresh)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def x_read_thread(url: str, max_posts: int = 20, include_replies: bool = False, refresh: bool = False) -> dict:
     """Discover connected public X thread posts, prioritizing the same author. Coverage is not guaranteed.
 
@@ -1560,7 +1560,7 @@ async def x_read_thread(url: str, max_posts: int = 20, include_replies: bool = F
     return await call_provider("read_thread", url=url, max_posts=max_posts, include_replies=include_replies, refresh=refresh)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def x_search(query: str, limit: int = 20, since: str | None = None,
                    until: str | None = None, from_user: str | None = None, refresh: bool = False) -> dict:
     """Find readable public X posts through free search discovery, without X search APIs or login.
@@ -1571,7 +1571,7 @@ async def x_search(query: str, limit: int = 20, since: str | None = None,
     return await call_provider("search", query=query, limit=limit, since=since, until=until, from_user=from_user, refresh=refresh)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def x_search_user(username: str, query: str, limit: int = 20, refresh: bool = False) -> dict:
     """Find public posts by a username (without @) using free web discovery. limit is 1..50."""
     from x_public import call_provider
