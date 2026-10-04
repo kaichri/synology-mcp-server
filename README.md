@@ -1,6 +1,6 @@
 # Synology MCP Server
 
-[![M8ven Verified](https://m8ven.ai/badge/mcp/kaichri-mcp-server-pq503z?variant=verified)](https://m8ven.ai/mcp/kaichri/mcp-server?s=readme)
+[![M8ven Verified](https://m8ven.ai/badge/mcp/kaichri-synology-mcp-server-12jumx?variant=verified)](https://m8ven.ai/mcp/kaichri-synology-mcp-server-12jumx?s=readme)
 
 Personal MCP server designed for deployment on Synology NAS. The current setup is tested primarily with ChatGPT, while the MCP interface itself remains client-agnostic. Other MCP-compatible clients can connect using the supported transport and authentication methods; compatibility with untested clients is not guaranteed.
 
