@@ -4,9 +4,9 @@ Stand: 2026-10-04. Basis: 0b9d68b, Branch main. Keine Finance-Logik geändert, k
 
 ## Empfehlung: KEEP + FIX
 
-Das Tool erzeugt aus mehreren Finance-Interests eine kompakte, strukturierte Kandidatenliste für Markt-/News-Digests. Allgemeine Webtools liefern Such- und Seiteninhalte, übernehmen aber nicht die Interest-Filter, Zuordnung, Lookback, Deduplizierung und Prioritätsauswahl. Sie sind daher kein vollständiger Ersatz. Das Tool sollte erhalten bleiben; die unten aufgeführten Korrekturen benötigen eine separate Freigabe.
+Das Tool erzeugt aus mehreren Finance-Interests eine kompakte, strukturierte Kandidatenliste für Markt-/News-Digests. Allgemeine Webtools liefern Such- und Seiteninhalte, übernehmen aber nicht die Interest-Filter, Zuordnung, Lookback, Deduplizierung und Prioritätsauswahl. Sie sind daher kein vollständiger Ersatz. Das Tool sollte erhalten bleiben; der unten dokumentierte separate Finance-Fix behebt die freigegebenen Punkte A-E. Weitere Findings bleiben Follow-ups.
 
-## Tatsächlicher Datenfluss
+## Datenfluss des Audits (vor dem separaten Finance-Fix)
 
 1. Parameter werden auf 1–10 Kandidaten und 6–72 Stunden begrenzt. JSON akzeptiert eine Liste oder ein Objekt mit `interests`. Ungültiges JSON bzw. nicht-listiges Ergebnis liefert ein Fehlerobjekt mit leerer Kandidatenliste.
 2. Akzeptiert werden Dictionaries mit exakt `category=finance` und `news_alert != off` (Default normal). Priority und Topics filtern nicht; sie beeinflussen Suchanfrage und spätere Reihenfolge. Ein leerer Name wird übersprungen, aber trotzdem in `searched_interests` gezählt. Die Zahl der Interests ist nicht begrenzt.
@@ -28,7 +28,7 @@ Das Tool erzeugt aus mehreren Finance-Interests eine kompakte, strukturierte Kan
 - `tests/test_business_regression.py::test_news_parsing_and_invalid_input` prüft Textparser und ungültiges JSON. OAuth-/Registry- und Schema-Tests prüfen Exposition, Auth-Metadaten und unveränderte Ein-/Ausgabeschemas, keine umfassende Finance-Logik.
 - Keine belastbaren Runtime-Nutzungsdaten wurden für diese Analyse erhoben. Fehlende interne Call-Sites beweisen keine fehlende externe Nutzung. Der vom Benutzer berichtete Live-Test belegt grundsätzliche Funktion für dessen Aufruf, aber keine allgemeine Nutzungshäufigkeit.
 
-## Bestätigte Schwachstellen; noch nicht behoben
+## Historische Audit-Findings (Status siehe Finance-Fix unten)
 
 - Undatierte Treffer bleiben bewusst erhalten. Das schützt Recall, bestätigt aber keinen aktuellen News-Bezug; ein altes undatiertes PDF kann den Lookback passieren. Für Latest-News ist eine separat entscheidbare Policy sinnvoll (ausschließen oder ausdrücklich unbestätigt markieren).
 - Direct-Fetch dekodiert alle Antworten als Text und verwirft den Content-Type in `_fetch_news_candidate_direct`; weder application/pdf noch `%PDF-` werden geprüft. Eine synthetische PDF-Antwort wird als Snippet übernommen. Minimaler späterer Fix: binäre/PDF-Antworten vor dem HTML-Parsing überspringen und Suchmetadaten behalten; keine PDF-Dependency nötig.
@@ -71,3 +71,23 @@ Produktiv-Diff: ausschließlich openWorldHint=False bei current_time und openWor
 ## Abschlussprüfung
 
 Vorher: 294 Tests bestanden (34,39 s). Nach Änderung: 296 Tests bestanden (36,19 s), einschließlich der zwei Listener-Annotation-Fälle. 16 zusätzliche lokale Offline-Probes bestanden, 0 externe Requests. git diff --check erfolgreich. AST-Vergleich: Produktivcode identisch nach Entfernen ausschließlich der neuen openWorldHint-Keywords. Prüfung vorhandener Secret-Werte gegen geänderte Dateien, Analyse und lokalen Diff ohne Treffer. Keine Secrets oder Konfiguration geändert. Kein Commit, Push, PR oder Deployment. Commit der Annotations, Tests und dieses Berichts empfohlen; Finance-Fixes separat entscheiden.
+
+## Separater Finance-Fix A-E
+
+### Behoben
+
+- Binary/PDF snippet handling: nur text/html, text/plain und application/xhtml+xml werden direkt geparst; PDF-Signatur und NUL-Bytes werden defensiv abgelehnt. Search-Metadaten bleiben erhalten. Der bestehende fetch_failed-Zaehler erfasst auch solche bewusst uebersprungenen Antworten.
+- Datumssortierung: innerhalb gleicher Priority-/Topic-Gruppe neueste zuerst, undatierte zuletzt. Priority und Topic-Match bleiben die wichtigsten Dimensionen.
+- Redundante Sortierung: genau eine Sortieroperation.
+- Timestamp-Lookback: Uhrzeit, Sekundenbruchteile und Offset bleiben erhalten; Vergleich erfolgt als UTC-Instant. Date-only beschreibt einen ungenauen ganzen UTC-Tag: behalten, wenn dieser Tag das Lookback-Fenster ueberlappt; sonst verwerfen. Midnight ist nur Sortier-/Intervallanker, keine behauptete Publikationszeit. Offsetlose Zeitstempel werden als UTC interpretiert.
+- Topic robustness: nur nichtleere Strings in einer Topic-Liste werden verwendet; Zahlen, None, Dictionaries, verschachtelte Listen und ungueltige Container ignoriert. Search und HTTP-Anreicherung nutzen dieselbe Validierung.
+
+### Offen
+
+SSRF/Redirect validation; Dedupe-Priority-Semantik, URL-Normalisierung und Duplikatzaehler; fehlende/gleiche Interest-IDs; unvollstaendige weitere Interest-Validierung; Search-Fehler-/Zaehlersemantik; undatierte alte Treffer; Datumsheuristiken im Seitentext; externe Nutzungshaeufigkeit unbekannt. Keine dieser Semantiken wurde nebenbei geaendert.
+
+### Tests
+
+Neue deterministische Tests in tests/test_finance_news.py fuer MIME-/PDF-/NUL-Abwehr, erlaubte Texttypen, Timestamp-/Offset-Lookback, Date-only-Tagesintervalle, Ranking, Priority-/Topic-Vorrang, robuste Topics, Filter, leere Ergebnisse, Dedupe, max_candidates und undatierte Treffer. Tool-Namen, Tool-Schemas und grundlegender JSON-Vertrag bleiben unveraendert. Kein Live-Smoke: die reproduzierten Fehler sind vollstaendig offline pruefbar, ohne kostenpflichtige Exa-Anfrage.
+
+Ergebnis des Finance-Fix-Laufs: 326 Tests bestanden (33,87 s), davon 30 neue Finance-Faelle. git diff --check und Secret-Pruefung erfolgreich. Kein Push, PR oder NAS-Deployment.

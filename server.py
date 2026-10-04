@@ -631,6 +631,33 @@ def _normalize_text(value: str) -> str:
     return value.strip()
 
 
+def _news_topics(interest: dict) -> list[str]:
+    """Ignore malformed topic containers/elements rather than stringify them."""
+    topics = interest.get("topics")
+    if not isinstance(topics, list):
+        return []
+    return [_normalize_text(topic) for topic in topics
+            if isinstance(topic, str) and topic.strip()]
+
+
+def _news_publication(value: str) -> tuple[datetime | None, bool]:
+    """Parse UTC-comparable instants; date-only values describe a whole UTC day.
+
+    Date-only results remain eligible when that day overlaps the lookback.
+    Their midnight is only an ordering/day-boundary anchor, not an exact
+    publication time. Timestamps lacking an offset are interpreted as UTC.
+    """
+    value = value.strip()
+    date_only = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone.utc)
+        return instant.astimezone(timezone.utc), date_only
+    except ValueError:
+        return None, False
+
+
 def _extract_news_item(item: dict, interest: dict) -> dict | None:
     title = (
         item.get("title")
@@ -671,7 +698,7 @@ def _extract_news_item(item: dict, interest: dict) -> dict | None:
     if not url:
         return None
 
-    topics = interest.get("topics") or []
+    topics = _news_topics(interest)
     haystack = f"{title} {snippet}".lower()
     matched_topics = [
         topic
@@ -793,7 +820,7 @@ def _extract_date_from_text(text: str) -> str:
         return ""
 
     patterns = [
-        r"\b(20\d{2}-\d{2}-\d{2})(?:[T\s]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})?)?\b",
+        r"\b(20\d{2}-\d{2}-\d{2})(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b",
         r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2})\b",
         r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+20\d{2})\b",
         r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+20\d{2})\b",
@@ -805,7 +832,7 @@ def _extract_date_from_text(text: str) -> str:
             value = match.group(0)
             iso_match = re.search(r"(20\d{2}-\d{2}-\d{2})", value)
             if iso_match:
-                found.append(iso_match.group(1))
+                found.append(value)
                 continue
 
             de_match = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(20\d{2})", value)
@@ -826,7 +853,9 @@ def _extract_date_from_text(text: str) -> str:
         return ""
 
     # Prefer the newest date found in the page/result text.
-    return max(found)
+    valid = [(value, _news_publication(value)[0]) for value in found]
+    valid = [(value, instant) for value, instant in valid if instant is not None]
+    return max(valid, key=lambda pair: pair[1])[0] if valid else ""
 
 
 def _extract_title_from_text(text: str) -> str:
@@ -942,7 +971,7 @@ def _parse_direct_http_page(url: str, raw: str, interest: dict) -> dict | None:
     except Exception:
         pass
 
-    topics = interest.get("topics") or []
+    topics = _news_topics(interest)
     haystack = f"{title} {snippet}".lower()
     matched_topics = [
         topic
@@ -992,8 +1021,13 @@ def _direct_http_fetch(url: str, timeout: int = 12) -> tuple[str, int, str]:
 
 async def _fetch_news_candidate_direct(url: str, interest: dict) -> dict | None:
     try:
-        raw, status, _ = await asyncio.to_thread(_direct_http_fetch, url)
+        raw, status, content_type = await asyncio.to_thread(_direct_http_fetch, url)
         if status < 200 or status >= 400:
+            return None
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        if media_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
+            return None
+        if raw.lstrip("\ufeff \t\r\n").startswith("%PDF-") or "\x00" in raw:
             return None
         return _parse_direct_http_page(url, raw, interest)
     except Exception:
@@ -1066,11 +1100,7 @@ async def finance_news_candidates(
 
     for interest in finance_interests:
         name = _normalize_text(str(interest.get("name") or ""))
-        topics = [
-            _normalize_text(str(topic))
-            for topic in (interest.get("topics") or [])
-            if str(topic).strip()
-        ]
+        topics = _news_topics(interest)
         if not name:
             continue
 
@@ -1165,15 +1195,11 @@ async def finance_news_candidates(
     undated_kept = 0
     for candidate in all_candidates.values():
         published = candidate.get("published") or ""
-        date_str = _extract_date_from_text(published)
-
-        if date_str:
-            try:
-                published_date = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
-                if published_date < cutoff:
-                    continue
-            except Exception:
-                undated_kept += 1
+        publication, date_only = _news_publication(_extract_date_from_text(published))
+        if publication is not None:
+            if ((date_only and publication + timedelta(days=1) <= cutoff)
+                    or (not date_only and publication < cutoff)):
+                continue
         else:
             undated_kept += 1
 
@@ -1196,23 +1222,16 @@ async def finance_news_candidates(
     candidates = list(deduped.values())
 
     priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    candidates.sort(
-        key=lambda item: (
+    def ranking_key(item):
+        publication, _ = _news_publication(_extract_date_from_text(item.get("published") or ""))
+        # Preserve priority/topic grouping; newest first, undated last.
+        return (
             priority_order.get(item.get("priority"), 99),
             0 if item.get("matched_topics") else 1,
-            item.get("published") or "0000-00-00",
-        ),
-        reverse=False,
-    )
-
-    # Prefer newest within equal priority/topic match.
-    candidates.sort(
-        key=lambda item: (
-            priority_order.get(item.get("priority"), 99),
-            0 if item.get("matched_topics") else 1,
-            item.get("published") or "0000-00-00",
+            -publication.timestamp() if publication is not None else float("inf"),
         )
-    )
+
+    candidates.sort(key=ranking_key)
     candidates = candidates[:max_candidates]
 
     return json.dumps(
