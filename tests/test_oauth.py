@@ -511,6 +511,21 @@ def test_reject_bad_cimd(config, monkeypatch, changes):
     oauth.store.close()
 
 
+def test_cimd_extra_advertised_grant_does_not_block_refresh(apps, monkeypatch):
+    _, public, oauth = apps
+    issued = tokens(public)
+    oauth.store.execute("DELETE FROM clients WHERE id=?", (CLIENT,))
+    extra_grant = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    metadata = dict(META, grant_types=[*META["grant_types"], extra_grant])
+    real_client = httpx.Client
+    monkeypatch.setattr("oauth_server.httpx.Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=metadata)), **kwargs))
+    assert refresh(public, issued["refresh_token"]).status_code == 200
+    response = public.post("/oauth/token", data={"client_id": CLIENT, "grant_type": extra_grant})
+    assert response.status_code == 400
+    assert response.json()["error"] == "unsupported_grant_type"
+
+
 @pytest.mark.parametrize("status", [302, 404])
 def test_cimd_no_redirects_or_error_fallback(config, monkeypatch, status):
     oauth = OAuthService(config)

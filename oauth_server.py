@@ -245,7 +245,7 @@ class OAuthService(AuthorizationServer):
             grants = metadata.get("grant_types", ["authorization_code"])
             response_types = metadata.get("response_types", ["code"])
             if (not isinstance(grants, list) or "authorization_code" not in grants
-                    or any(grant not in {"authorization_code", "refresh_token"} for grant in grants)
+                    or any(not isinstance(grant, str) for grant in grants)
                     or not isinstance(response_types, list) or "code" not in response_types):
                 return None
             self.store.cache_client(client_id, metadata)
