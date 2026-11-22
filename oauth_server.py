@@ -205,7 +205,7 @@ class OAuthService(AuthorizationServer):
         super().__init__(scopes_supported=SCOPES)
         self.config = config
         self.store = Store(config.database)
-        self._last_cleanup = 0.0
+        self._last_cleanup = None
         self.register_grant(CodeGrant, [S256(required=True)])
         self.register_grant(RefreshGrant)
         self.register_token_generator("default", self.generate_bearer)
@@ -216,7 +216,7 @@ class OAuthService(AuthorizationServer):
 
     def _maybe_cleanup(self, *, force=False):
         now_monotonic = time.monotonic()
-        if force or now_monotonic - self._last_cleanup >= 3600:
+        if force or self._last_cleanup is None or now_monotonic - self._last_cleanup >= 3600:
             self._last_cleanup = now_monotonic
             self.store.cleanup()
 

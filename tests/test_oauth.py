@@ -774,11 +774,12 @@ def test_cimd_stale_fallback_only_on_transient_errors(config, monkeypatch):
     oauth.store.close()
 
 
-def test_token_endpoint_triggers_periodic_cleanup(apps):
+def test_token_endpoint_triggers_periodic_cleanup(apps, monkeypatch):
     _, public, oauth = apps
     oauth.store.execute(
         "INSERT INTO tokens (jti,client,username,scope,resource,expires,refresh_hash,refresh_expires,family) VALUES (?,?,?,?,?,?,?,?,?)",
         ("expired-jti", CLIENT, "owner", "mcp:read", BASE + "/mcp", 1, None, 0, "fam"))
-    oauth._last_cleanup = 0.0
+    monkeypatch.setattr("oauth_server.time.monotonic", lambda: 10.0)
+    oauth._last_cleanup = None
     public.post("/oauth/token", data={"grant_type": "refresh_token", "client_id": CLIENT, "refresh_token": "none"})
     assert oauth.store.one("SELECT * FROM tokens WHERE jti='expired-jti'") is None
