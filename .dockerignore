@@ -22,3 +22,9 @@ data
 *.key
 *.log
 tests
+docs
+tools
+.github
+pyproject.toml
+analysis-xeneon
+panel-analysis.txt

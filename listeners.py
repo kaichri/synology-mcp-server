@@ -3,6 +3,7 @@ import asyncio
 from contextlib import contextmanager
 import logging
 import json
+import re
 import secrets
 import signal
 import sqlite3
@@ -44,6 +45,20 @@ def auth_challenge(config, error=None, description=None):
     return value
 
 
+PROTOCOL_VERSION_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _clamp_protocol_headers(headers):
+    clamped = []
+    for key, value in headers:
+        if key == b"mcp-protocol-version":
+            version = value.decode("latin-1").strip()
+            if PROTOCOL_VERSION_RE.fullmatch(version) and version > "2025-11-25":
+                value = b"2025-11-25"
+        clamped.append((key, value))
+    return clamped
+
+
 class ProtocolCompatibility:
     """Preserve the existing mcp_dart protocol-header compatibility on LAN only."""
     def __init__(self, app):
@@ -52,10 +67,7 @@ class ProtocolCompatibility:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             scope = dict(scope)
-            scope["headers"] = [
-                (key, b"2025-11-25" if key == b"mcp-protocol-version"
-                 and value.decode("latin-1") > "2025-11-25" else value)
-                for key, value in scope["headers"]]
+            scope["headers"] = _clamp_protocol_headers(scope["headers"])
         await self.app(scope, receive, send)
 
 
@@ -80,7 +92,7 @@ class ExternalAuthorization:
                     legacy_used = True
                 else:
                     try:
-                        claims = self.oauth.verify_access(token)
+                        claims = await run_in_threadpool(self.oauth.verify_access, token)
                         insufficient = "mcp:read" not in claims["scope"].split()
                         valid = not insufficient
                     except (jwt.InvalidTokenError, ValueError, TypeError):
@@ -113,16 +125,13 @@ class ExternalAuthorization:
         scope["mcp_external_oauth"] = self.oauth
         if legacy_used:
             # Existing mcp_dart clients also use the legacy token over the Internet.
-            scope = dict(scope)
-            scope["headers"] = [
-                (key, b"2025-11-25" if key == b"mcp-protocol-version"
-                 and value.decode("latin-1") > "2025-11-25" else value)
-                for key, value in scope["headers"]]
+            scope["headers"] = _clamp_protocol_headers(scope["headers"])
         await self.app(scope, receive, send)
 
     async def rejected_tool_call(self, scope, receive):
         headers = dict(scope["headers"])
-        if scope["method"] != "POST" or headers.get(b"content-type", b"").split(b";")[0] != b"application/json":
+        content_type = headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower()
+        if scope["method"] != "POST" or content_type != b"application/json":
             return None
         try:
             async with asyncio.timeout(2):
@@ -151,12 +160,19 @@ def create_apps(mcp, config):
         mcp.middleware.append(ToolSecurityMetadata())
     public = urlsplit(config.public_base_url)
     public_host = public.netloc
+    public_hosts = list(dict.fromkeys([
+        public_host,
+        public.hostname,
+        f"{public.hostname}:443",
+        "localhost:8001",
+        "127.0.0.1:8001",
+        "mcp-server:8001",
+    ]))
     lan_security = TransportSecuritySettings(
         allowed_hosts=[config.lan_host, config.lan_host + ":8000", "localhost:8000", "127.0.0.1:8000"],
         allowed_origins=[f"http://{config.lan_host}:8000"])
     external_security = TransportSecuritySettings(
-        allowed_hosts=[public_host, public_host + ":443" if public.port is None else public_host,
-                       "localhost:8001", "127.0.0.1:8001", "mcp-server:8001"],
+        allowed_hosts=public_hosts,
         allowed_origins=[config.public_base_url])
     # Separate session managers: an unauthenticated LAN session cannot cross into the public listener.
     lan = mcp.streamable_http_app(transport_security=lan_security, stateless_http=False, json_response=False)
@@ -203,12 +219,19 @@ async def serve(mcp):
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for server in servers:
-            server.should_exit = True
-        await asyncio.gather(*tasks)
-        oauth.store.close()
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        try:
+            for server in servers:
+                server.should_exit = True
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            try:
+                from exa_provider import close_shared_clients
+                await close_shared_clients()
+            except Exception:
+                pass
+            oauth.store.close()
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def main(mcp):

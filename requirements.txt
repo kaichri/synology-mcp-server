@@ -6,3 +6,4 @@ Authlib==1.8.0
 argon2-cffi==25.1.0
 PyJWT[crypto]==2.15.1
 httpx==0.28.1
+requests==2.34.2

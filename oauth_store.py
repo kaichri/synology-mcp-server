@@ -44,6 +44,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS pending (
                 id TEXT PRIMARY KEY, params TEXT, csrf_hash TEXT, expires INTEGER);
             CREATE TABLE IF NOT EXISTS rate_limits (name TEXT PRIMARY KEY, count INTEGER, reset INTEGER);
+            CREATE INDEX IF NOT EXISTS idx_tokens_family ON tokens(family);
+            CREATE INDEX IF NOT EXISTS idx_tokens_expires ON tokens(expires, refresh_expires);
         """)
         if os.name != "nt":
             for suffix in ("-wal", "-shm"):

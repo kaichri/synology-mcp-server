@@ -31,9 +31,14 @@ META = {"client_id": CLIENT, "redirect_uris": [REDIRECT],
         "token_endpoint_auth_method": "private_key_jwt"}
 
 
+@pytest.fixture(scope="session")
+def password_hash():
+    return PasswordHasher().hash(PASSWORD)
+
+
 @pytest.fixture
-def config(tmp_path):
-    return OAuthConfig(BASE, "owner", PasswordHasher().hash(PASSWORD),
+def config(tmp_path, password_hash):
+    return OAuthConfig(BASE, "owner", password_hash,
                        database=str(tmp_path / "oauth.sqlite3"), legacy_token="test-only-legacy-token")
 
 
@@ -224,9 +229,7 @@ def test_full_oauth_flow_identical_tools_and_call(apps):
         {k: v for k, v in t.items() if k not in ("_meta", "securitySchemes")} for t in public_tools]
     expected = json.loads(__import__('pathlib').Path("tests/tool_schemas.json").read_text())
     actual = {t["name"]: {k: t.get(k) for k in ["inputSchema", "outputSchema"]} for t in lan_tools}
-    assert {name: actual[name] for name in expected} == expected
-    assert set(actual) - set(expected) == {"x_read_post", "x_read_thread", "x_search", "x_search_user",
-                                         "web_deep_search", "web_search_and_fetch"}
+    assert actual == expected
     for tool in lan_tools:
         assert tool["annotations"]["readOnlyHint"] is True
         assert tool["annotations"]["destructiveHint"] is False
@@ -575,6 +578,7 @@ def test_refresh_after_access_expiry_preserves_binding_and_deadline(apps, monkey
     assert old["expires_in"] == 3600
     assert row["refresh_expires"] - (row["expires"] - 3600) == 63072000
     advance_oauth_clock(monkeypatch, row["expires"] + 1)
+    oauth.store.execute("UPDATE clients SET fetched=?", (row["expires"] + 1,))
     assert initialize(public, old["access_token"]).status_code == 401
     form = {"grant_type": "refresh_token", "client_id": CLIENT, "refresh_token": old["refresh_token"]}
     if resource is not None:
@@ -607,11 +611,13 @@ def test_absolute_family_expiry_730_days(apps, monkeypatch, seconds_before_expir
     old = tokens(public)
     row = oauth.store.one("SELECT * FROM tokens WHERE refresh_hash=?", (digest(old["refresh_token"]),))
     advance_oauth_clock(monkeypatch, row["refresh_expires"] - seconds_before_expiry)
+    oauth.store.execute("UPDATE clients SET fetched=?", (row["refresh_expires"] - seconds_before_expiry,))
     response = refresh(public, old["refresh_token"])
     assert response.status_code == expected
     if expected == 200:
         new = response.json()
         advance_oauth_clock(monkeypatch, row["refresh_expires"])
+        oauth.store.execute("UPDATE clients SET fetched=?", (row["refresh_expires"],))
         assert refresh(public, new["refresh_token"]).status_code == 400
 
 
@@ -732,3 +738,47 @@ def test_offline_only_opt_out_does_not_gain_resource_scope(apps):
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_scope"
     assert oauth.store.one("SELECT COUNT(*) FROM codes")[0] == 0
+
+
+def test_case_insensitive_content_types_accepted(apps):
+    _, public, _ = apps
+    code = authorize(public)
+    from urllib.parse import urlencode
+    body = urlencode({"grant_type": "authorization_code", "client_id": CLIENT, "code": code,
+                      "redirect_uri": REDIRECT, "code_verifier": VERIFIER, "resource": BASE + "/mcp"})
+    response = public.post("/oauth/token", content=body,
+                           headers={"Content-Type": "Application/X-WWW-Form-Urlencoded ; charset=utf-8"})
+    assert response.status_code == 200
+    denied = public.post("/mcp", content=json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                                     "params": {"name": "current_time", "arguments": {}}}),
+                         headers={"Content-Type": "Application/JSON ; charset=utf-8"})
+    assert denied.status_code == 401
+    assert denied.json()["result"]["isError"] is True
+
+
+def test_cimd_stale_fallback_only_on_transient_errors(config, monkeypatch):
+    oauth = OAuthService(config)
+    now = int(time.time())
+    oauth.store.execute("INSERT OR REPLACE INTO clients VALUES (?, ?, ?)",
+                        (CLIENT, json.dumps(META), now - 7200))
+    real_client = httpx.Client
+    monkeypatch.setattr("oauth_server.httpx.Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(503)), **kwargs))
+    assert oauth.query_client(CLIENT).client_id == CLIENT
+    monkeypatch.setattr("oauth_server.httpx.Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda req: (_ for _ in ()).throw(httpx.ConnectTimeout("timeout"))), **kwargs))
+    assert oauth.query_client(CLIENT).client_id == CLIENT
+    monkeypatch.setattr("oauth_server.httpx.Client", lambda **kwargs: real_client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(404)), **kwargs))
+    assert oauth.query_client(CLIENT) is None
+    oauth.store.close()
+
+
+def test_token_endpoint_triggers_periodic_cleanup(apps):
+    _, public, oauth = apps
+    oauth.store.execute(
+        "INSERT INTO tokens (jti,client,username,scope,resource,expires,refresh_hash,refresh_expires,family) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("expired-jti", CLIENT, "owner", "mcp:read", BASE + "/mcp", 1, None, 0, "fam"))
+    oauth._last_cleanup = 0.0
+    public.post("/oauth/token", data={"grant_type": "refresh_token", "client_id": CLIENT, "refresh_token": "none"})
+    assert oauth.store.one("SELECT * FROM tokens WHERE jti='expired-jti'") is None

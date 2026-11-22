@@ -15,8 +15,27 @@ import threading
 import time
 from typing import Awaitable, Callable, Protocol
 from urllib.parse import urlsplit
+import weakref
 
 import httpx
+
+_http_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+
+
+def _shared_http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _http_clients.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(trust_env=False, follow_redirects=False)
+        _http_clients[loop] = client
+    return client
+
+
+async def close_shared_clients() -> None:
+    loop = asyncio.get_running_loop()
+    client = _http_clients.pop(loop, None)
+    if client is not None and not client.is_closed:
+        await client.aclose()
 
 MAX_RESULTS = 20
 MAX_FETCH = 5
@@ -243,27 +262,33 @@ class DirectExaApiProvider:
     async def _post(self, endpoint, payload, timeout=REQUEST_SECONDS):
         if not self._key:
             raise ExaError("EXA_AUTH_ERROR", reason="api_key_missing")
+
+        async def send(client):
+            async with client.stream("POST", "https://api.exa.ai/" + endpoint,
+                                     headers={"x-api-key": self._key}, json=payload, timeout=timeout) as response:
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise ExaError("EXA_UNAVAILABLE", reason="response_size_limit")
+                try:
+                    data = json.loads(body)
+                except (ValueError, UnicodeError):
+                    data = None
+                if response.status_code != 200:
+                    raise classify(response.status_code, data)
+                if isinstance(data, dict) and data.get("error"):
+                    raise classify(response.status_code, data)
+                if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                    raise ExaError("EXA_UNAVAILABLE", reason="malformed_response")
+                return redact(data, self._key)
+
         try:
-            async with httpx.AsyncClient(transport=self._transport, trust_env=False,
-                                        follow_redirects=False, timeout=timeout) as client:
-                async with client.stream("POST", "https://api.exa.ai/" + endpoint,
-                                         headers={"x-api-key": self._key}, json=payload) as response:
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > MAX_RESPONSE_BYTES:
-                            raise ExaError("EXA_UNAVAILABLE", reason="response_size_limit")
-                    try:
-                        data = json.loads(body)
-                    except (ValueError, UnicodeError):
-                        data = None
-                    if response.status_code != 200:
-                        raise classify(response.status_code, data)
-                    if isinstance(data, dict) and data.get("error"):
-                        raise classify(response.status_code, data)
-                    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-                        raise ExaError("EXA_UNAVAILABLE", reason="malformed_response")
-                    return redact(data, self._key)
+            if self._transport is not None:
+                async with httpx.AsyncClient(transport=self._transport, trust_env=False,
+                                             follow_redirects=False, timeout=timeout) as client:
+                    return await send(client)
+            return await send(_shared_http_client())
         except Exception as error:
             raise exception_error(error) from None
 
@@ -352,7 +377,11 @@ def parse_remote(raw):
             if match:
                 current["url"] = match.group(1)
             else:
-                current["text"] += line + "\n"
+                published = re.match(r"^Published:\s*(.+)$", line, re.I)
+                if published and not current.get("publishedDate"):
+                    current["publishedDate"] = published.group(1).strip()
+                else:
+                    current["text"] += line + "\n"
     if current and current.get("url"):
         entries.append(current)
     return entries, bool(entries)
@@ -469,11 +498,17 @@ class ExaRouter:
                     if failed:
                         events = [{"provider": "exa_direct", "reason": "partial_contents_failure",
                                    "failed_urls": failed}]
-                        replacement = await self._remote_fetch(failed, events)
-                        mapping = {p["requested_url"]: p for p in replacement["results"]}
-                        result["results"] = [mapping.get(p["requested_url"], p) for p in result["results"]]
-                        result["fallbacks"] = replacement["fallbacks"]
-                        result["fallback_usage"] = replacement["usage"]
+                        try:
+                            replacement = await self._remote_fetch(failed, events)
+                        except ExaError as error:
+                            if len(failed) == len(result["results"]):
+                                raise
+                            result["fallbacks"] = events + [{"provider": "exa_remote_mcp", **error.as_dict()}]
+                        else:
+                            mapping = {p["requested_url"]: p for p in replacement["results"]}
+                            result["results"] = [mapping.get(p["requested_url"], p) for p in result["results"]]
+                            result["fallbacks"] = replacement["fallbacks"]
+                            result["fallback_usage"] = replacement["usage"]
                 return result
         if method == "contents":
             return await self._remote_fetch(argument, fallbacks)
@@ -552,7 +587,7 @@ class ExaRouter:
 def render(result):
     if result.get("raw_text") is not None:
         return result["raw_text"]
-    # Title/URL labels also preserve the finance-news parser's existing format.
+    # Keep readable Title/URL/Published text blocks.
     return "\n\n".join("Title: " + str(p.get("title") or "") + "\nURL: " + str(p.get("url") or "")
                         + "\nPublished: " + str(p.get("published_at") or "") + "\n" + p["text"]
                         for p in result["results"] if not p.get("error"))

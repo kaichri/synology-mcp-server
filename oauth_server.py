@@ -205,6 +205,7 @@ class OAuthService(AuthorizationServer):
         super().__init__(scopes_supported=SCOPES)
         self.config = config
         self.store = Store(config.database)
+        self._last_cleanup = 0.0
         self.register_grant(CodeGrant, [S256(required=True)])
         self.register_grant(RefreshGrant)
         self.register_token_generator("default", self.generate_bearer)
@@ -213,17 +214,27 @@ class OAuthService(AuthorizationServer):
         logging.getLogger("authlib.oauth2.rfc6749.grants.authorization_code").setLevel(logging.WARNING)
         logging.getLogger("authlib.oauth2.rfc6749.grants.refresh_token").setLevel(logging.WARNING)
 
+    def _maybe_cleanup(self, *, force=False):
+        now_monotonic = time.monotonic()
+        if force or now_monotonic - self._last_cleanup >= 3600:
+            self._last_cleanup = now_monotonic
+            self.store.cleanup()
+
     def query_client(self, client_id):
         if not isinstance(client_id, str) or not re.fullmatch(r"https://chatgpt\.com/oauth/(?:[A-Za-z0-9_-]+/)?client\.json", client_id):
             return None
+        now = time.time()
         cached = self.store.one("SELECT * FROM clients WHERE id=?", (client_id,))
-        if cached and cached["fetched"] + 3600 > time.time():
+        if cached and cached["fetched"] + 3600 > now:
             return Client(client_id, json.loads(cached["metadata"]))
+        stale_client = (Client(client_id, json.loads(cached["metadata"]))
+                        if cached and cached["fetched"] + 86400 > now else None)
         try:
             # Exact trusted origin, no redirects, no ambient proxy credentials, bounded body.
             with httpx.Client(timeout=5, follow_redirects=False, trust_env=False) as client:
                 with client.stream("GET", client_id, headers={"Accept": "application/json"}) as response:
-                    response.raise_for_status()
+                    if response.status_code >= 500:
+                        return stale_client
                     if response.status_code != 200 or response.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
                         return None
                     body = bytearray()
@@ -250,6 +261,8 @@ class OAuthService(AuthorizationServer):
                 return None
             self.store.cache_client(client_id, metadata)
             return Client(client_id, metadata)
+        except httpx.TransportError:
+            return stale_client
         except (httpx.HTTPError, ValueError, TypeError, AttributeError):
             return None
 
@@ -344,7 +357,7 @@ class OAuthService(AuthorizationServer):
     def authorize_get_sync(self, pairs):
         if self.store.limited("authorize", 60):
             return self.error("temporarily_unavailable", 429)
-        self.store.cleanup()
+        self._maybe_cleanup(force=True)
         try:
             req = self.oauth_request("GET", "/oauth/authorize", pairs)
             self.get_consent_grant(req)
@@ -410,45 +423,48 @@ Verbindung ohne erneute Anmeldung automatisch erneuern</label>
                 return self.error("invalid_request", 403, "consent_request_expired")
             if not secrets.compare_digest(pending["csrf_hash"], digest(cookie)):
                 return self.error("invalid_request", 403, "consent_request_cookie_mismatch")
-            req = self.oauth_request("GET", "/oauth/authorize", json.loads(pending["params"]))
+            pending_params = json.loads(pending["params"])
             # A failed login consumes the pending request; retry starts a fresh flow.
             self.store.execute("DELETE FROM pending WHERE id=?", (pending["id"],))
-            if form.get("decision") == "deny":
-                user = None
-            else:
-                try:
-                    valid = PasswordHasher().verify(self.config.password_hash, form.get("password", ""))
-                except (VerificationError, InvalidHashError):
-                    valid = False
-                if not valid or not secrets.compare_digest(form.get("username", "").encode(), self.config.username.encode()):
-                    return self.error("access_denied", 403)
-                user = self.config.username
+        # Perform password hashing and any CIMD network I/O outside the SQLite write lock.
+        if form.get("decision") == "deny":
+            user = None
+        else:
             try:
-                # Revalidate the stored original request before applying consent.
-                # POST fields cannot replace resource scopes or protocol bindings.
+                valid = PasswordHasher().verify(self.config.password_hash, form.get("password", ""))
+            except (VerificationError, InvalidHashError):
+                valid = False
+            if not valid or not secrets.compare_digest(form.get("username", "").encode(), self.config.username.encode()):
+                return self.error("access_denied", 403)
+            user = self.config.username
+        req = self.oauth_request("GET", "/oauth/authorize", pending_params)
+        try:
+            # Revalidate the stored original request before applying consent.
+            # POST fields cannot replace resource scopes or protocol bindings.
+            grant = self.get_consent_grant(req)
+            if user is not None:
+                if form.get("offline_access") not in (None, "1"):
+                    raise InvalidRequestError("Invalid offline access consent")
+                scopes = list(dict.fromkeys((req.scope or "mcp:read").split()))
+                scopes = [scope for scope in scopes if scope != "offline_access"]
+                if form.get("offline_access") == "1":
+                    scopes.append("offline_access")
+                if not scopes:
+                    raise InvalidScopeError("At least one scope must be approved")
+                pairs = [(key, value) for key, value in pending_params if key != "scope"]
+                pairs.append(("scope", " ".join(scopes)))
+                req = self.oauth_request("GET", "/oauth/authorize", pairs)
                 grant = self.get_consent_grant(req)
-                if user is not None:
-                    if form.get("offline_access") not in (None, "1"):
-                        raise InvalidRequestError("Invalid offline access consent")
-                    scopes = list(dict.fromkeys((req.scope or "mcp:read").split()))
-                    scopes = [scope for scope in scopes if scope != "offline_access"]
-                    if form.get("offline_access") == "1":
-                        scopes.append("offline_access")
-                    if not scopes:
-                        raise InvalidScopeError("At least one scope must be approved")
-                    pairs = [(key, value) for key, value in json.loads(pending["params"])
-                             if key != "scope"]
-                    pairs.append(("scope", " ".join(scopes)))
-                    req = self.oauth_request("GET", "/oauth/authorize", pairs)
-                    grant = self.get_consent_grant(req)
+            with self.store.transaction():
                 response = self.create_authorization_response(req, grant_user=user, grant=grant)
-            except OAuth2Error as error:
-                response = self.handle_error_response(req, error)
-            response.delete_cookie(COOKIE, path="/", secure=True, httponly=True, samesite="lax")
-            return response
+        except OAuth2Error as error:
+            response = self.handle_error_response(req, error)
+        response.delete_cookie(COOKIE, path="/", secure=True, httponly=True, samesite="lax")
+        return response
 
     async def read_form(self, request):
-        if request.headers.get("content-type", "").split(";")[0] != "application/x-www-form-urlencoded":
+        content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/x-www-form-urlencoded":
             return None
         body = bytearray()
         async for chunk in request.stream():
@@ -470,6 +486,7 @@ Verbindung ohne erneute Anmeldung automatisch erneuern</label>
     def token_sync(self, pairs, headers):
         if self.store.limited("token", 120):
             return self.error("temporarily_unavailable", 429)
+        self._maybe_cleanup()
         try:
             req = self.oauth_request("POST", "/oauth/token", pairs, headers)
             # Serialize validation, issuance, code consumption and refresh rotation across processes.

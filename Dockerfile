@@ -20,6 +20,9 @@ COPY exa_provider.py ./
 RUN groupadd --gid 10001 mcp && useradd --uid 10001 --gid mcp --no-create-home mcp && \
     mkdir -p /data && chown mcp:mcp /data
 
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV HOME=/tmp
 ENV MCP_OAUTH_DATABASE=/data/oauth.sqlite3
 ENV MCP_X_CACHE_PATH=/data/x-public.sqlite3
 USER mcp

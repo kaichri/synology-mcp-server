@@ -37,15 +37,40 @@ def test_web_search_and_fetch_contract(monkeypatch):
 
 
 def test_youtube_metadata_contract(monkeypatch):
-    monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw:
-                        SimpleNamespace(returncode=0, stdout=json.dumps({"id": "abc123", "title": "Video"}), stderr=""))
+    calls = []
+    def fake_run(cmd, *a, **kw):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"id": "abc123", "title": "Video"}), stderr="")
+    monkeypatch.setattr(server.subprocess, "run", fake_run)
+    monkeypatch.setattr(server, "_youtube_cooldowns", {server.YOUTUBE_DIRECT: (0.0, 2)})
     result = json.loads(asyncio.run(server.youtube_metadata("https://youtu.be/abc123")))
     assert result["id"] == "abc123" and result["title"] == "Video"
+    assert calls[0][-2:] == ["--", "https://www.youtube.com/watch?v=abc123"]
+    assert server.YOUTUBE_DIRECT not in server._youtube_cooldowns
 
 
-def test_news_parsing_and_invalid_input():
-    parsed = server._parse_exa_results("Title: News\nURL: https://example.org/news\nPublished: 2026-09-30\nSnippet: Market update")
-    assert parsed[0]["url"] == "https://example.org/news"
-    assert parsed[0]["publishedDate"] == "2026-09-30"
-    result = json.loads(asyncio.run(server.finance_news_candidates("not-json")))
-    assert result["candidates"] == [] and "error" in result
+@pytest.mark.parametrize("bad_url", [
+    "--batch-file=/etc/passwd",
+    "-a=/run/secrets/oauth_password_hash",
+    "file:///etc/passwd",
+    "http://127.0.0.1:8000/mcp",
+    "https://example.org/watch?v=abc123",
+    "https://www.youtube.com/watch?v=abc/def",
+    "https://youtu.be/abc/../../etc/passwd",
+])
+def test_youtube_rejects_argument_injection_and_non_youtube_urls(monkeypatch, bad_url):
+    def unexpected(*a, **kw):
+        pytest.fail("yt-dlp must never run for invalid YouTube URLs")
+    monkeypatch.setattr(server.subprocess, "run", unexpected)
+    assert "error" in asyncio.run(server.youtube_metadata(bad_url)).lower()
+    assert "error" in asyncio.run(server.youtube_comments(bad_url)).lower()
+    assert "error" in asyncio.run(server.youtube_transcript(bad_url)).lower()
+
+
+def test_youtube_vtt_without_hours_and_sub_url_validation():
+    segments = server._parse_vtt_captions("WEBVTT\n\n01:05.500 --> 01:08.000\nHello world\n")
+    assert segments == [(65.5, "Hello world")]
+    for unsafe in ("file:///etc/passwd", "http://www.youtube.com/api/timedtext",
+                   "https://127.0.0.1/api/timedtext", "https://evil.example/sub.vtt"):
+        with pytest.raises(ValueError):
+            server._fetch_sub_url(unsafe)

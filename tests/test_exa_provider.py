@@ -429,3 +429,21 @@ def test_deep_output_bound():
         "content": "x" * 51000, "grounding": []}}))
     result = run(provider.search(exa.SearchRequest("query"), deep=True))
     assert len(result["output"]["content"]) == 50000 and result["output_truncated"]
+
+
+def test_parse_remote_extracts_published_date():
+    entries, parsed = exa.parse_remote(f"Title: Release\nURL: {URL}\nPublished: 2026-10-05\nSummary text")
+    assert parsed and entries[0]["publishedDate"] == "2026-10-05"
+    assert "Published:" not in entries[0]["text"]
+
+
+def test_partial_direct_contents_preserves_successes_when_remote_fails():
+    provider = direct_with(lambda r: httpx.Response(200, json={
+        "results": [{"id": URL, "url": URL, "text": "Success"}],
+        "statuses": [{"id": URL, "status": "success"},
+                     {"id": URL2, "status": "error", "error": {"tag": "CRAWL_TIMEOUT"}}]}))
+    remote = FakeProvider(exa.ExaError("EXA_UNAVAILABLE"))
+    result = run(router(provider, remote).contents([URL, URL2]))
+    assert result["results"][0]["text"] == "Success"
+    assert result["results"][1]["error"]["code"] == "EXA_TIMEOUT"
+    assert [f["provider"] for f in result["fallbacks"]] == ["exa_direct", "exa_remote_mcp"]

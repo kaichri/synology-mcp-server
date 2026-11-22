@@ -9,7 +9,7 @@ from urllib.parse import quote
 import pytest
 import x_public as x
 import server
-from test_oauth import apps, config, tokens, tools_list, rpc_response
+from test_oauth import apps, config, password_hash, tokens, tools_list, rpc_response
 
 URL = "https://x.com/example/status/123456789"
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -116,6 +116,7 @@ def test_cache_refresh_and_expiry(tmp_path, monkeypatch):
     cache = x.Cache(str(tmp_path / "cache.sqlite3"))
     cache.put("test", {"text": "public"}, 10)
     assert cache.get("test") == {"text": "public"}
+    assert cache._connect().execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     now[0] += 11
     assert cache.get("test") is None
     http = FakeHTTP({URL: BODY})
@@ -125,6 +126,7 @@ def test_cache_refresh_and_expiry(tmp_path, monkeypatch):
     assert first["post"]["cached"] is False and second["post"]["cached"] is True
     asyncio.run(provider.read_post(URL, refresh=True))
     assert len(http.calls) == 2
+    cache.close()
 
 
 def test_disabled_cache(monkeypatch):
@@ -371,3 +373,24 @@ def test_new_tools_execute_through_both_mcp_listeners(apps, monkeypatch):
     denied = public.post("/mcp", headers={"Content-Type": "application/json"}, json={
         "jsonrpc": "2.0", "id": 32, "method": "tools/call", "params": {"name": "x_read_post", "arguments": {"url": URL}}})
     assert denied.status_code == 401 and len(calls) == 8
+
+
+def test_ipv6_failure_falls_back_to_ipv4(monkeypatch):
+    attempted = []
+    monkeypatch.setattr(x, "public_addresses", lambda host, port: ["2001:db8::1", "93.184.216.34"])
+    def fake_connect(addr, timeout, source):
+        attempted.append(addr)
+        if addr[0] == "2001:db8::1":
+            raise OSError("Network is unreachable")
+        return "ok-socket"
+    monkeypatch.setattr(socket, "create_connection", fake_connect)
+    class Connection:
+        sock = None
+        def __init__(self, host, port, **kwargs): pass
+        def request(self, method, path, headers):
+            assert self._create_connection(("x.com", 443), 8) == "ok-socket"
+        def getresponse(self): return Response()
+        def close(self): pass
+    monkeypatch.setattr(x.http.client, "HTTPSConnection", Connection)
+    x.PublicHTTP().fetch(URL)
+    assert attempted == [("2001:db8::1", 443), ("93.184.216.34", 443)]

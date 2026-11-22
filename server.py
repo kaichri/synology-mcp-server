@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 import asyncio
 import json
@@ -124,8 +124,17 @@ async def _run_youtube_job(tool, work, route, cache_key=None):
     outcome = "error"
 
     def cached():
+        if cache_key is None:
+            return None
         entry = _transcript_cache.get(cache_key)
-        return entry[1] if entry and entry[0] > time.monotonic() else None
+        if not entry:
+            return None
+        if entry[0] <= time.monotonic():
+            _transcript_cache.pop(cache_key, None)
+            return None
+        _transcript_cache.pop(cache_key, None)
+        _transcript_cache[cache_key] = entry
+        return entry[1]
 
     acquired = False
     try:
@@ -159,8 +168,11 @@ async def _run_youtube_job(tool, work, route, cache_key=None):
             try:
                 result, success = await work()
                 if success and cache_key is not None and len(result) <= 500_000:
+                    now_monotonic = time.monotonic()
+                    for expired_key in [k for k, (exp, _) in _transcript_cache.items() if exp <= now_monotonic]:
+                        _transcript_cache.pop(expired_key, None)
                     _transcript_cache.pop(cache_key, None)
-                    _transcript_cache[cache_key] = (time.monotonic() + YOUTUBE_TRANSCRIPT_TTL, result)
+                    _transcript_cache[cache_key] = (now_monotonic + YOUTUBE_TRANSCRIPT_TTL, result)
                     while len(_transcript_cache) > 64:
                         del _transcript_cache[next(iter(_transcript_cache))]
                 return result
@@ -193,10 +205,21 @@ async def _run_youtube_job(tool, work, route, cache_key=None):
 # YOUTUBE HELPERS
 # ============================================================
 
+YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
 def get_video_id(url: str) -> str:
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(c) <= 32 for c in url):
+        raise ValueError("Could not extract YouTube video ID from URL.")
+
     parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
+        raise ValueError("Could not extract YouTube video ID from URL.")
+    if parsed.port not in (None, 80 if parsed.scheme == "http" else 443):
+        raise ValueError("Could not extract YouTube video ID from URL.")
 
     host = (parsed.hostname or "").lower()
+    candidate: str | None = None
 
     if host in (
         "www.youtube.com",
@@ -205,43 +228,21 @@ def get_video_id(url: str) -> str:
     ):
         # https://www.youtube.com/watch?v=VIDEO_ID
         video_id = parse_qs(parsed.query).get("v")
-
         if video_id:
-            return video_id[0]
+            candidate = video_id[0]
+        else:
+            # /live/VIDEO_ID, /shorts/VIDEO_ID, /embed/VIDEO_ID
+            match = re.fullmatch(r"/(?:live|shorts|embed)/([^/?#]+)/?", parsed.path)
+            if match:
+                candidate = match.group(1)
+    elif host == "youtu.be":
+        # https://youtu.be/VIDEO_ID
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 1:
+            candidate = parts[0]
 
-        # https://www.youtube.com/live/VIDEO_ID
-        match = re.match(
-            r"/live/([^/?]+)",
-            parsed.path
-        )
-
-        if match:
-            return match.group(1)
-
-        # https://www.youtube.com/shorts/VIDEO_ID
-        match = re.match(
-            r"/shorts/([^/?]+)",
-            parsed.path
-        )
-
-        if match:
-            return match.group(1)
-
-        # https://www.youtube.com/embed/VIDEO_ID
-        match = re.match(
-            r"/embed/([^/?]+)",
-            parsed.path
-        )
-
-        if match:
-            return match.group(1)
-
-    # https://youtu.be/VIDEO_ID
-    if host == "youtu.be":
-        video_id = parsed.path.strip("/").split("/")[0]
-
-        if video_id:
-            return video_id
+    if candidate and YOUTUBE_VIDEO_ID_RE.fullmatch(candidate):
+        return candidate
 
     raise ValueError(
         "Could not extract YouTube video ID from URL."
@@ -405,7 +406,7 @@ def _parse_json3_captions(text: str) -> list[tuple[float, str]]:
 def _parse_vtt_captions(text: str) -> list[tuple[float, str]]:
 
     time_re = re.compile(
-        r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->"
+        r"(?:(\d{1,2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->"
     )
 
     segments: list[tuple[float, str]] = []
@@ -437,9 +438,10 @@ def _parse_vtt_captions(text: str) -> list[tuple[float, str]]:
 
             if match:
                 flush()
-                hours, minutes, secs, millis = (
+                hours = int(match.group(1) or 0)
+                minutes, secs, millis = (
                     int(match.group(i))
-                    for i in range(1, 5)
+                    for i in range(2, 5)
                 )
                 start = (
                     hours * 3600
@@ -516,10 +518,23 @@ def _list_sub_tracks(
     return deduped
 
 
+def _validate_sub_url(url: str) -> None:
+    if not isinstance(url, str) or len(url) > 4096 or any(ord(c) <= 32 for c in url):
+        raise ValueError("Unsupported subtitle URL.")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or parsed.port not in (None, 443)
+            or not (host in ("youtube.com", "www.youtube.com")
+                    or host.endswith((".youtube.com", ".googlevideo.com")))):
+        raise ValueError("Unsupported subtitle URL.")
+
+
 def _fetch_sub_url(url: str, attempts: int = 2) -> str:
 
     from urllib.request import Request, urlopen
 
+    _validate_sub_url(url)
     last_error: Exception | None = None
 
     for attempt in range(attempts):
@@ -551,7 +566,7 @@ def _fetch_sub_url(url: str, attempts: int = 2) -> str:
 
             if attempt + 1 < attempts:
                 time.sleep(
-                    (3, 8, 16)[attempt]
+                    (3, 8, 16)[min(attempt, 2)]
                 )
 
     raise last_error or RuntimeError("subtitle fetch failed")
@@ -571,6 +586,7 @@ def _transcript_via_ytdlp(
                 "--no-playlist",
                 "--skip-download",
                 "--no-warnings",
+                "--",
                 f"https://www.youtube.com/watch?v={video_id}",
             ],
             capture_output=True,
@@ -583,13 +599,7 @@ def _transcript_via_ytdlp(
             raise limit
 
         if result.returncode != 0:
-
-            lines = result.stderr.strip().splitlines()
-
-            return (
-                None,
-                lines[-1] if lines else "yt-dlp metadata failed",
-            )
+            return None, "yt-dlp metadata failed"
 
         data = json.loads(result.stdout)
 
@@ -790,656 +800,34 @@ async def web_search_and_fetch(query: str, num_results: int = 10, fetch_top: int
 
 
 # ============================================================
-# FINANCE NEWS CANDIDATES
-# ============================================================
-
-def _normalize_text(value: str) -> str:
-    value = value or ""
-    value = re.sub(r"\s+", " ", value)
-    return value.strip()
-
-
-def _news_topics(interest: dict) -> list[str]:
-    """Ignore malformed topic containers/elements rather than stringify them."""
-    topics = interest.get("topics")
-    if not isinstance(topics, list):
-        return []
-    return [_normalize_text(topic) for topic in topics
-            if isinstance(topic, str) and topic.strip()]
-
-
-def _news_publication(value: str) -> tuple[datetime | None, bool]:
-    """Parse UTC-comparable instants; date-only values describe a whole UTC day.
-
-    Date-only results remain eligible when that day overlaps the lookback.
-    Their midnight is only an ordering/day-boundary anchor, not an exact
-    publication time. Timestamps lacking an offset are interpreted as UTC.
-    """
-    value = value.strip()
-    date_only = bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
-    try:
-        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if instant.tzinfo is None:
-            instant = instant.replace(tzinfo=timezone.utc)
-        return instant.astimezone(timezone.utc), date_only
-    except ValueError:
-        return None, False
-
-
-def _extract_news_item(item: dict, interest: dict) -> dict | None:
-    title = (
-        item.get("title")
-        or item.get("name")
-        or ""
-    )
-
-    url = (
-        item.get("url")
-        or item.get("link")
-        or ""
-    )
-
-    published = (
-        item.get("publishedDate")
-        or item.get("published_date")
-        or item.get("date")
-        or ""
-    )
-
-    snippet = (
-        item.get("text")
-        or item.get("snippet")
-        or item.get("description")
-        or item.get("highlights")
-        or ""
-    )
-
-    source = ""
-    if url:
-        try:
-            source = urlparse(url).hostname or ""
-            if source.startswith("www."):
-                source = source[4:]
-        except Exception:
-            source = ""
-
-    if not url:
-        return None
-
-    topics = _news_topics(interest)
-    haystack = f"{title} {snippet}".lower()
-    matched_topics = [
-        topic
-        for topic in topics
-        if topic and topic.lower() in haystack
-    ]
-
-    return {
-        "asset": interest.get("name"),
-        "interest_id": interest.get("id"),
-        "category": interest.get("category"),
-        "priority": interest.get("priority"),
-        "matched_topics": matched_topics,
-        "title": _normalize_text(str(title)),
-        "url": url,
-        "source": source,
-        "published": str(published or ""),
-        "snippet": _normalize_text(str(snippet))[:700],
-        "news_key": url,
-    }
-
-
-def _parse_exa_results(raw: str) -> list[dict]:
-    """Parse Exa search output, including its text/Markdown format."""
-    results: list[dict] = []
-    if not raw:
-        return results
-
-    # 1) JSON output.
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            for key in ("results", "items", "data"):
-                if isinstance(data.get(key), list):
-                    data = data[key]
-                    break
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict):
-                    results.append(item)
-            if results:
-                return results
-    except Exception:
-        pass
-
-    # 2) Exa text output:
-    #    Title: ...
-    #    URL: ...
-    #    Published: ...
-    #    ...
-    #    Title: ...
-    lines = [line.rstrip() for line in raw.splitlines()]
-    current: dict | None = None
-
-    def flush() -> None:
-        nonlocal current
-        if current and current.get("url"):
-            current["text"] = _normalize_text(current.get("text", ""))[:1200]
-            results.append(current)
-        current = None
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        match = re.match(r"^Title:\s*(.*)$", stripped, flags=re.IGNORECASE)
-        if match:
-            flush()
-            current = {"title": match.group(1).strip()}
-            continue
-
-        if current is None:
-            continue
-
-        match = re.match(r"^URL:\s*(\S+)$", stripped, flags=re.IGNORECASE)
-        if match:
-            current["url"] = match.group(1).strip()
-            continue
-
-        match = re.match(r"^Published:\s*(.*)$", stripped, flags=re.IGNORECASE)
-        if match:
-            current["publishedDate"] = match.group(1).strip()
-            continue
-
-        if re.match(r"^(Author|Highlights|Summary|Snippet):", stripped, flags=re.IGNORECASE):
-            label, value = stripped.split(":", 1)
-            value = value.strip()
-            if label.lower() != "author" and value:
-                current["text"] = value
-            continue
-
-        # Continuation of the descriptive/highlights text.
-        if current.get("url"):
-            existing = current.get("text", "")
-            current["text"] = f"{existing} {stripped}".strip()
-
-    flush()
-
-    # 3) Last-resort URL extraction.
-    if results:
-        return results
-
-    urls = re.findall(r"https?://[^\s<>\]\)\"']+", raw)
-    seen = set()
-    for url in urls:
-        url = url.rstrip(".,;:)]}")
-        if url in seen:
-            continue
-        seen.add(url)
-        results.append({"url": url})
-
-    return results
-
-
-def _extract_date_from_text(text: str) -> str:
-    """Best-effort extraction of a publication date from text/HTML."""
-    if not text:
-        return ""
-
-    patterns = [
-        r"\b(20\d{2}-\d{2}-\d{2})(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?\b",
-        r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2})\b",
-        r"\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},\s+20\d{2})\b",
-        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+20\d{2})\b",
-    ]
-
-    found: list[str] = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            value = match.group(0)
-            iso_match = re.search(r"(20\d{2}-\d{2}-\d{2})", value)
-            if iso_match:
-                found.append(value)
-                continue
-
-            de_match = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(20\d{2})", value)
-            if de_match:
-                day, month, year = de_match.groups()
-                found.append(f"{year}-{int(month):02d}-{int(day):02d}")
-                continue
-
-            cleaned = value.replace(".", "")
-            for fmt in ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y"):
-                try:
-                    found.append(datetime.strptime(cleaned, fmt).date().isoformat())
-                    break
-                except ValueError:
-                    continue
-
-    if not found:
-        return ""
-
-    # Prefer the newest date found in the page/result text.
-    valid = [(value, _news_publication(value)[0]) for value in found]
-    valid = [(value, instant) for value, instant in valid if instant is not None]
-    return max(valid, key=lambda pair: pair[1])[0] if valid else ""
-
-
-def _extract_title_from_text(text: str) -> str:
-    """Extract a useful page title from HTML/metadata/text."""
-    if not text:
-        return ""
-
-    # HTML title.
-    match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
-    if match:
-        title = _normalize_text(re.sub(r"<[^>]+>", " ", match.group(1)))
-        if title:
-            return title[:300]
-
-    # OpenGraph title.
-    for pattern in (
-        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\'][^>]*>',
-        r'<meta[^>]+name=["\']title["\'][^>]+content=["\'](.*?)["\'][^>]*>',
-    ):
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            title = _normalize_text(re.sub(r"<[^>]+>", " ", match.group(1)))
-            if title:
-                return title[:300]
-
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
-        if match:
-            return _normalize_text(match.group(1))[:300]
-
-    match = re.search(r"(?im)^\s*(?:title|headline)\s*:\s*(.+?)\s*$", text)
-    if match:
-        return _normalize_text(match.group(1))[:300]
-
-    return ""
-
-
-def _extract_snippet_from_text(text: str, title: str = "") -> str:
-    """Extract compact readable text from HTML/response text."""
-    if not text:
-        return ""
-
-    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    text = _normalize_text(text)
-
-    if title:
-        text = re.sub(re.escape(title), " ", text, count=1, flags=re.IGNORECASE)
-
-    return _normalize_text(text)[:900]
-
-
-def _extract_meta_value(html: str, keys: tuple[str, ...]) -> str:
-    for key in keys:
-        patterns = (
-            rf'<meta[^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]+content=["\'](.*?)["\'][^>]*>',
-            rf'<meta[^>]+content=["\'](.*?)["\'][^>]+(?:property|name)=["\']{re.escape(key)}["\'][^>]*>',
-        )
-        for pattern in patterns:
-            match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
-            if match:
-                value = _normalize_text(match.group(1))
-                if value:
-                    return value
-    return ""
-
-
-def _parse_direct_http_page(url: str, raw: str, interest: dict) -> dict | None:
-    title = _extract_title_from_text(raw)
-    if not title:
-        title = _extract_meta_value(raw, ("og:title", "twitter:title"))
-
-    published = _extract_meta_value(
-        raw,
-        (
-            "article:published_time",
-            "og:published_time",
-            "datePublished",
-            "date",
-            "pubdate",
-        ),
-    )
-    if not published:
-        jsonld_dates = re.findall(
-            r'"(?:datePublished|dateCreated|uploadDate)"\s*:\s*"([^\"]+)"',
-            raw,
-            flags=re.IGNORECASE,
-        )
-        if jsonld_dates:
-            published = max(jsonld_dates)
-
-    snippet = _extract_meta_value(raw, ("description", "og:description", "twitter:description"))
-    if not snippet:
-        snippet = _extract_snippet_from_text(raw, title)
-
-    if not published:
-        published = _extract_date_from_text(raw[:200000])
-    else:
-        normalized_date = _extract_date_from_text(published)
-        if normalized_date:
-            published = normalized_date
-
-    source = ""
-    try:
-        source = urlparse(url).hostname or ""
-        if source.startswith("www."):
-            source = source[4:]
-    except Exception:
-        pass
-
-    topics = _news_topics(interest)
-    haystack = f"{title} {snippet}".lower()
-    matched_topics = [
-        topic
-        for topic in topics
-        if topic and topic.lower() in haystack
-    ]
-
-    if not title and not snippet:
-        return None
-
-    return {
-        "asset": interest.get("name"),
-        "interest_id": interest.get("id"),
-        "category": interest.get("category"),
-        "priority": interest.get("priority"),
-        "matched_topics": matched_topics,
-        "title": title[:300],
-        "url": url,
-        "source": source,
-        "published": published,
-        "snippet": snippet[:700],
-        "news_key": url,
-    }
-
-
-def _direct_http_fetch(url: str, timeout: int = 12) -> tuple[str, int, str]:
-    """Fetch a public page directly without using Exa fetch."""
-    from urllib.request import Request, urlopen
-
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
-            "Accept-Language": "en-US,en;q=0.8,de;q=0.6",
-            "Cache-Control": "no-cache",
-        },
-    )
-
-    with urlopen(request, timeout=timeout) as response:
-        content_type = response.headers.get("Content-Type", "")
-        charset_match = re.search(r"charset=([\w.-]+)", content_type, flags=re.IGNORECASE)
-        charset = charset_match.group(1) if charset_match else "utf-8"
-        data = response.read(2_000_000)
-        return data.decode(charset, errors="replace"), response.status, content_type
-
-
-async def _fetch_news_candidate_direct(url: str, interest: dict) -> dict | None:
-    try:
-        raw, status, content_type = await asyncio.to_thread(_direct_http_fetch, url)
-        if status < 200 or status >= 400:
-            return None
-        media_type = content_type.split(";", 1)[0].strip().lower()
-        if media_type not in {"text/html", "text/plain", "application/xhtml+xml"}:
-            return None
-        if raw.lstrip("\ufeff \t\r\n").startswith("%PDF-") or "\x00" in raw:
-            return None
-        return _parse_direct_http_page(url, raw, interest)
-    except Exception:
-        return None
-
-
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
-async def finance_news_candidates(
-    interests_json: str,
-    max_candidates: int = 6,
-    lookback_hours: int = 36,
-) -> str:
-    """
-    Search finance/news candidates with Exa, then enrich missing fields with
-    direct HTTP fetches. Exa page-fetch is intentionally not used.
-    """
-
-    max_candidates = max(1, min(max_candidates, 10))
-    lookback_hours = max(6, min(lookback_hours, 72))
-
-    try:
-        interests = json.loads(interests_json)
-    except json.JSONDecodeError as e:
-        return json.dumps(
-            {"error": f"Invalid interests_json: {e}", "candidates": []},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    if isinstance(interests, dict):
-        interests = interests.get("interests", [])
-
-    if not isinstance(interests, list):
-        return json.dumps(
-            {"error": "interests_json must contain a list of interests.", "candidates": []},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    finance_interests = [
-        interest
-        for interest in interests
-        if isinstance(interest, dict)
-        and interest.get("category") == "finance"
-        and interest.get("news_alert", "normal") != "off"
-    ]
-
-    if not finance_interests:
-        return json.dumps(
-            {
-                "lookback_hours": lookback_hours,
-                "searched_interests": 0,
-                "raw_results": 0,
-                "urls_found": 0,
-                "fetched": 0,
-                "fetch_failed": 0,
-                "undated_kept": 0,
-                "duplicates_removed": 0,
-                "candidate_count": 0,
-                "candidates": [],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-
-    all_candidates: dict[str, dict] = {}
-    raw_result_count = 0
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=lookback_hours)
-
-    for interest in finance_interests:
-        name = _normalize_text(str(interest.get("name") or ""))
-        topics = _news_topics(interest)
-        if not name:
-            continue
-
-        topic_text = " ".join(f'"{topic}"' for topic in topics[:5])
-        query = f'"{name}" {topic_text} latest news finance'.strip()
-
-        try:
-            raw = await web_search(query, 6)
-        except Exception:
-            continue
-
-        parsed_results = _parse_exa_results(raw)
-        raw_result_count += len(parsed_results)
-
-        for item in parsed_results:
-            candidate = _extract_news_item(item, interest)
-            if not candidate:
-                continue
-
-            key = candidate["url"].lower().rstrip("/")
-            existing = all_candidates.get(key)
-            if existing:
-                existing_topics = set(existing.get("matched_topics", []))
-                existing_topics.update(candidate.get("matched_topics", []))
-                existing["matched_topics"] = sorted(existing_topics)
-                continue
-
-            # Use an explicitly supplied publication date immediately.
-            published = candidate.get("published") or ""
-            normalized_date = _extract_date_from_text(published)
-            if normalized_date:
-                candidate["published"] = normalized_date
-
-            all_candidates[key] = candidate
-
-    urls_found = len(all_candidates)
-
-    # Fetch only candidates whose search result is missing useful metadata.
-    fetch_targets = [
-        (key, candidate)
-        for key, candidate in all_candidates.items()
-        if not candidate.get("title") or not candidate.get("snippet") or not candidate.get("published")
-    ]
-
-    fetched = 0
-    fetch_failed = 0
-    if fetch_targets:
-        sem = asyncio.Semaphore(3)
-
-        async def one_fetch(key: str, candidate: dict):
-            async with sem:
-                return key, await _fetch_news_candidate_direct(candidate["url"], candidate["asset"] and {
-                    "name": candidate.get("asset"),
-                    "id": candidate.get("interest_id"),
-                    "category": candidate.get("category"),
-                    "priority": candidate.get("priority"),
-                    "topics": [],
-                } or {})
-
-        # Reconstruct original interest lookup for matched topic calculation.
-        interest_by_id = {str(i.get("id")): i for i in finance_interests if isinstance(i, dict)}
-
-        async def one_fetch2(key: str, candidate: dict):
-            async with sem:
-                interest = interest_by_id.get(str(candidate.get("interest_id")), {})
-                return key, await _fetch_news_candidate_direct(candidate["url"], interest)
-
-        results = await asyncio.gather(
-            *(one_fetch2(key, candidate) for key, candidate in fetch_targets),
-            return_exceptions=True,
-        )
-
-        for result in results:
-            if isinstance(result, Exception) or not result:
-                fetch_failed += 1
-                continue
-            key, fetched_candidate = result
-            if not fetched_candidate:
-                fetch_failed += 1
-                continue
-
-            fetched += 1
-            original = all_candidates.get(key, {})
-            for field in ("title", "published", "snippet", "source"):
-                if fetched_candidate.get(field):
-                    original[field] = fetched_candidate[field]
-            if fetched_candidate.get("matched_topics"):
-                original["matched_topics"] = fetched_candidate["matched_topics"]
-
-    # Final lookback filtering.
-    kept: list[dict] = []
-    undated_kept = 0
-    for candidate in all_candidates.values():
-        published = candidate.get("published") or ""
-        publication, date_only = _news_publication(_extract_date_from_text(published))
-        if publication is not None:
-            if ((date_only and publication + timedelta(days=1) <= cutoff)
-                    or (not date_only and publication < cutoff)):
-                continue
-        else:
-            undated_kept += 1
-
-        kept.append(candidate)
-
-    # Deterministic dedupe/ranking.
-    deduped: dict[str, dict] = {}
-    for candidate in kept:
-        key = candidate["url"].lower().rstrip("/")
-        if key not in deduped:
-            deduped[key] = candidate
-            continue
-
-        existing = deduped[key]
-        existing_topics = set(existing.get("matched_topics", []))
-        existing_topics.update(candidate.get("matched_topics", []))
-        existing["matched_topics"] = sorted(existing_topics)
-
-    duplicates_removed = len(kept) - len(deduped)
-    candidates = list(deduped.values())
-
-    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-    def ranking_key(item):
-        publication, _ = _news_publication(_extract_date_from_text(item.get("published") or ""))
-        # Preserve priority/topic grouping; newest first, undated last.
-        return (
-            priority_order.get(item.get("priority"), 99),
-            0 if item.get("matched_topics") else 1,
-            -publication.timestamp() if publication is not None else float("inf"),
-        )
-
-    candidates.sort(key=ranking_key)
-    candidates = candidates[:max_candidates]
-
-    return json.dumps(
-        {
-            "lookback_hours": lookback_hours,
-            "searched_interests": len(finance_interests),
-            "raw_results": raw_result_count,
-            "urls_found": urls_found,
-            "fetched": fetched,
-            "fetch_failed": fetch_failed,
-            "undated_kept": undated_kept,
-            "duplicates_removed": duplicates_removed,
-            "candidate_count": len(candidates),
-            "candidates": candidates,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-# ============================================================
 # YOUTUBE - METADATA
 # ============================================================
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
 async def youtube_metadata(url: str) -> str:
     """Get detailed YouTube metadata without downloading the video."""
+    try:
+        video_id = get_video_id(url)
+    except ValueError as exc:
+        return f"YouTube metadata error: {exc}"
     return await _run_youtube_job(
-        "youtube_metadata", lambda: _youtube_ytdlp_job("metadata", _youtube_metadata, url),
+        "youtube_metadata", lambda: _youtube_ytdlp_job("metadata", _youtube_metadata, video_id),
         YOUTUBE_DIRECT)
 
 
 async def _youtube_ytdlp_job(stage, function, *args):
     try:
-        return await asyncio.to_thread(function, *args), False
+        result, ok = await asyncio.to_thread(function, *args)
+        if ok:
+            _youtube_cooldowns.pop(YOUTUBE_DIRECT, None)
+        return result, False
     except YouTubeRateLimited as error:
         return _record_youtube_limit(YOUTUBE_DIRECT, stage, error), False
 
 
-def _youtube_metadata(url: str) -> str:
+def _youtube_metadata(video_id: str) -> tuple[str, bool]:
+
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
 
@@ -1450,7 +838,8 @@ def _youtube_metadata(url: str) -> str:
                 "--no-download",
                 "--no-playlist",
                 "--no-warnings",
-                url,
+                "--",
+                canonical_url,
             ],
             capture_output=True,
             text=True,
@@ -1462,15 +851,7 @@ def _youtube_metadata(url: str) -> str:
             raise limit
 
         if result.returncode != 0:
-
-            error = result.stderr.strip()
-
-            return (
-                f"YouTube metadata error: {error}"
-                if error
-                else
-                "YouTube metadata could not be retrieved."
-            )
+            return "YouTube metadata could not be retrieved.", False
 
         data = json.loads(
             result.stdout
@@ -1503,21 +884,21 @@ def _youtube_metadata(url: str) -> str:
             metadata,
             ensure_ascii=False,
             separators=(",", ":")
-        )
+        ), True
 
     except YouTubeRateLimited:
         raise
 
     except json.JSONDecodeError as e:
 
-        return f"Metadata JSON error: {e}"
+        return f"Metadata JSON error: {e}", False
 
     except Exception as e:
 
         return (
             f"Metadata error: "
             f"{type(e).__name__}: {e}"
-        )
+        ), False
 
 
 # ============================================================
@@ -1531,7 +912,10 @@ async def youtube_transcript(
 ) -> str:
     """Get a YouTube transcript. Public transcript MCP first, own fetch, then yt-dlp as fallback."""
 
-    video_id = get_video_id(url)
+    try:
+        video_id = get_video_id(url)
+    except ValueError as exc:
+        return f"Transcript error: {exc}"
 
     requested_languages = [
         x.strip()
@@ -1645,12 +1029,16 @@ async def youtube_comments(
     sort: str = "top"
 ) -> str:
     """Get YouTube comments in a compact format."""
+    try:
+        video_id = get_video_id(url)
+    except ValueError as exc:
+        return f"Comments error: {exc}"
     return await _run_youtube_job(
-        "youtube_comments", lambda: _youtube_ytdlp_job("comments", _youtube_comments, url, limit, sort),
+        "youtube_comments", lambda: _youtube_ytdlp_job("comments", _youtube_comments, video_id, limit, sort),
         YOUTUBE_DIRECT)
 
 
-def _youtube_comments(url, limit, sort):
+def _youtube_comments(video_id: str, limit: int, sort: str) -> tuple[str, bool]:
 
     limit = max(
         1,
@@ -1659,6 +1047,8 @@ def _youtube_comments(url, limit, sort):
 
     if sort not in ("top", "new"):
         sort = "top"
+
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
 
@@ -1672,7 +1062,8 @@ def _youtube_comments(url, limit, sort):
                 "%(comments)j",
                 "--extractor-args",
                 f"youtube:comment_sort={sort};max_comments={limit}",
-                url,
+                "--",
+                canonical_url,
             ],
             capture_output=True,
             text=True,
@@ -1682,7 +1073,7 @@ def _youtube_comments(url, limit, sort):
 
     except subprocess.TimeoutExpired:
 
-        return "Comments error: yt-dlp timed out."
+        return "Comments error: yt-dlp timed out.", False
 
     except subprocess.CalledProcessError as e:
 
@@ -1690,11 +1081,7 @@ def _youtube_comments(url, limit, sort):
         if rate_limit := _youtube_rate_limit(error):
             raise rate_limit from e
 
-        return (
-            f"Comments error: {error}"
-            if error
-            else "Comments could not be retrieved."
-        )
+        return "Comments could not be retrieved.", False
 
     if rate_limit := _youtube_rate_limit(result.stderr):
         raise rate_limit
@@ -1702,7 +1089,7 @@ def _youtube_comments(url, limit, sort):
 
     if not output:
 
-        return "No comments available."
+        return "No comments available.", True
 
     try:
 
@@ -1712,11 +1099,11 @@ def _youtube_comments(url, limit, sort):
 
     except json.JSONDecodeError:
 
-        return "Could not parse comments."
+        return "Could not parse comments.", False
 
     if not comments:
 
-        return "No comments available."
+        return "No comments available.", True
 
     lines = []
 
@@ -1754,9 +1141,9 @@ def _youtube_comments(url, limit, sort):
 
     if not lines:
 
-        return "No usable comments found."
+        return "No usable comments found.", True
 
-    return "\n".join(lines)
+    return "\n".join(lines), True
 
 
 # ============================================================

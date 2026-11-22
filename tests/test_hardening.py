@@ -16,7 +16,7 @@ from oauth_config import OAuthConfig, validate_password_hash
 from oauth_server import OAuthService, valid_redirect
 from oauth_store import Store
 from server import mcp
-from test_oauth import apps, config, BASE, CLIENT, META, PASSWORD, initialize, tokens, tools_list, auth_params
+from test_oauth import apps, config, password_hash, BASE, CLIENT, META, PASSWORD, initialize, tokens, tools_list, auth_params
 
 
 def test_security_metadata_is_request_local(apps):
@@ -27,7 +27,7 @@ def test_security_metadata_is_request_local(apps):
         public_future = pool.submit(tools_list, public, token)
         lan_tools, _ = lan_future.result()
         public_tools, _ = public_future.result()
-    assert len(lan_tools) == len(public_tools) == 13
+    assert len(lan_tools) == len(public_tools) == 12
     for tool in public_tools:
         assert tool["securitySchemes"] == tool["_meta"]["securitySchemes"] == [{"type": "oauth2", "scopes": ["mcp:read"]}]
     for tool in lan_tools:

@@ -1,6 +1,5 @@
 """Best-effort, anonymous public X reader. No login, internal APIs or browser code."""
 import asyncio
-from contextlib import closing
 from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 import http.client
@@ -16,6 +15,7 @@ import threading
 import time
 from typing import Protocol
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+import weakref
 
 X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com", "mobile.x.com"}
 FETCH_HOSTS = X_HOSTS | {"t.co", "html.duckduckgo.com"}
@@ -88,9 +88,21 @@ class PublicHTTP:
                     connection = http.client.HTTPSConnection(p.hostname, port, timeout=timeout, context=ssl.create_default_context())
                 else:
                     connection = http.client.HTTPConnection(p.hostname, port, timeout=timeout)
-                # Connect only to the IP already checked, never resolve a second time.
-                connection._create_connection = lambda address, timeout, source_address=None: socket.create_connection(
-                    (addresses[0], port), timeout, source_address)
+                # Connect only to the IPs already checked, never resolve a second time.
+                def _pinned_connect(address, conn_timeout, source_address=None):
+                    last_error = None
+                    for ip in addresses:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            return socket.create_connection(
+                                (ip, port), min(conn_timeout, remaining), source_address)
+                        except OSError as exc:
+                            last_error = exc
+                    raise last_error or TimeoutError("Public request timed out.")
+
+                connection._create_connection = _pinned_connect
                 try:
                     connection.request("GET", p.path + ("?" + p.query if p.query else ""), headers={
                         "User-Agent": "PublicMCPReader/1.0", "Accept": "text/html, application/json", "Accept-Encoding": "identity"})
@@ -328,31 +340,65 @@ def parse_page(url, body):
     return {"post": posts[wanted], "related_posts": list(posts.values()), "status_links": list(dict.fromkeys(links))[:100]}
 
 
+def _close_sqlite(db):
+    try:
+        db.close()
+    except sqlite3.Error:
+        pass
+
+
 class Cache:
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
+        self._db = None
+        self._finalizer = None
 
     def _connect(self):
+        if self._db is not None:
+            return self._db
         path = Path(self.path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
-        db = sqlite3.connect(path, timeout=5)
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+        db = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        db.execute("PRAGMA busy_timeout=5000")
+        db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE IF NOT EXISTS public_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires REAL NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_public_cache_expires ON public_cache(expires)")
+        if os.name != "nt":
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(path) + suffix)
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o600)
+        self._db = db
+        self._finalizer = weakref.finalize(self, _close_sqlite, db)
         return db
 
     def get(self, key):
-        with self.lock, closing(self._connect()) as db, db:
+        with self.lock:
+            db = self._connect()
             row = db.execute("SELECT value FROM public_cache WHERE key=? AND expires>?", (key, time.time())).fetchone()
             return json.loads(row[0]) if row else None
 
     def put(self, key, value, ttl):
-        with self.lock, closing(self._connect()) as db, db:
-            db.execute("DELETE FROM public_cache WHERE expires<=?", (time.time(),))
-            db.execute("INSERT OR REPLACE INTO public_cache VALUES (?,?,?)", (key, json.dumps(value), time.time() + ttl))
-            # Bound persistent storage even when a client supplies many distinct searches.
-            db.execute("DELETE FROM public_cache WHERE key IN (SELECT key FROM public_cache ORDER BY expires DESC LIMIT -1 OFFSET 2000)")
+        with self.lock:
+            db = self._connect()
+            now = time.time()
+            with db:
+                db.execute("DELETE FROM public_cache WHERE expires<=?", (now,))
+                db.execute("INSERT OR REPLACE INTO public_cache VALUES (?,?,?)", (key, json.dumps(value), now + ttl))
+                # Bound persistent storage even when a client supplies many distinct searches.
+                db.execute("DELETE FROM public_cache WHERE key IN (SELECT key FROM public_cache ORDER BY expires DESC LIMIT -1 OFFSET 2000)")
+
+    def close(self):
+        with self.lock:
+            if self._finalizer is not None:
+                self._finalizer()
+                self._finalizer = None
+            self._db = None
 
 
 class XPublicProvider(Protocol):
@@ -501,12 +547,18 @@ class FreePublicProvider:
                 warnings.append(exc.code)
         selected = {seed["post_id"]: seed}
         for _ in range(len(candidates)):
+            changed = False
             for post_id, post in candidates.items():
+                if post_id in selected:
+                    continue
                 same_author = bool(seed["username"] and post["username"] and seed["username"].lower() == post["username"].lower())
                 related = bool(seed["conversation_id"] and post["conversation_id"] == seed["conversation_id"])
                 related = related or post["reply_to_post_id"] in selected or any(p["reply_to_post_id"] == post_id for p in selected.values())
                 if related and (include_replies or same_author):
                     selected[post_id] = post
+                    changed = True
+            if not changed:
+                break
         known_dates = all(p["published_at"] for p in selected.values())
         posts = sorted(selected.values(), key=lambda p: (p["published_at"], int(p["post_id"])) if known_dates else int(p["post_id"]))
         termination = "max_posts_reached" if len(posts) >= max_posts else "provider_limit" if links else "thread_end_unknown"

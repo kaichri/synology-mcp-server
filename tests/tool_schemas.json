@@ -80,28 +80,18 @@
       "type": "object"
     }
   },
-  "finance_news_candidates": {
+  "web_deep_search": {
     "inputSchema": {
       "properties": {
-        "interests_json": {
-          "title": "Interests Json",
+        "query": {
+          "title": "Query",
           "type": "string"
-        },
-        "max_candidates": {
-          "default": 6,
-          "title": "Max Candidates",
-          "type": "integer"
-        },
-        "lookback_hours": {
-          "default": 36,
-          "title": "Lookback Hours",
-          "type": "integer"
         }
       },
       "required": [
-        "interests_json"
+        "query"
       ],
-      "title": "finance_news_candidatesArguments",
+      "title": "web_deep_searchArguments",
       "type": "object"
     },
     "outputSchema": {
@@ -114,7 +104,45 @@
       "required": [
         "result"
       ],
-      "title": "finance_news_candidatesOutput",
+      "title": "web_deep_searchOutput",
+      "type": "object"
+    }
+  },
+  "web_search_and_fetch": {
+    "inputSchema": {
+      "properties": {
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "num_results": {
+          "default": 10,
+          "title": "Num Results",
+          "type": "integer"
+        },
+        "fetch_top": {
+          "default": 5,
+          "title": "Fetch Top",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "web_search_and_fetchArguments",
+      "type": "object"
+    },
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "web_search_and_fetchOutput",
       "type": "object"
     }
   },
@@ -216,5 +244,150 @@
       "title": "youtube_commentsOutput",
       "type": "object"
     }
+  },
+  "x_read_post": {
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "title": "Url",
+          "type": "string"
+        },
+        "refresh": {
+          "default": false,
+          "title": "Refresh",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "x_read_postArguments",
+      "type": "object"
+    },
+    "outputSchema": null
+  },
+  "x_read_thread": {
+    "inputSchema": {
+      "properties": {
+        "url": {
+          "title": "Url",
+          "type": "string"
+        },
+        "max_posts": {
+          "default": 20,
+          "title": "Max Posts",
+          "type": "integer"
+        },
+        "include_replies": {
+          "default": false,
+          "title": "Include Replies",
+          "type": "boolean"
+        },
+        "refresh": {
+          "default": false,
+          "title": "Refresh",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "title": "x_read_threadArguments",
+      "type": "object"
+    },
+    "outputSchema": null
+  },
+  "x_search": {
+    "inputSchema": {
+      "properties": {
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "limit": {
+          "default": 20,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "since": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Since"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Until"
+        },
+        "from_user": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "From User"
+        },
+        "refresh": {
+          "default": false,
+          "title": "Refresh",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "x_searchArguments",
+      "type": "object"
+    },
+    "outputSchema": null
+  },
+  "x_search_user": {
+    "inputSchema": {
+      "properties": {
+        "username": {
+          "title": "Username",
+          "type": "string"
+        },
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "limit": {
+          "default": 20,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "refresh": {
+          "default": false,
+          "title": "Refresh",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "username",
+        "query"
+      ],
+      "title": "x_search_userArguments",
+      "type": "object"
+    },
+    "outputSchema": null
   }
 }

@@ -13,7 +13,8 @@ services:
 
     environment:
       TZ: Europe/Vienna
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN}
+      HOME: /tmp
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
       MCP_ALLOW_LEGACY_TOKEN: ${MCP_ALLOW_LEGACY_TOKEN:-true}
       MCP_PUBLIC_BASE_URL: ${MCP_PUBLIC_BASE_URL:-https://mcp.example.com}
       MCP_LAN_HOST: ${MCP_LAN_BIND_IP:-192.168.1.50}
@@ -25,6 +26,12 @@ services:
       MCP_AUTH_CODE_SECONDS: ${MCP_AUTH_CODE_SECONDS:-120}
       MCP_X_CACHE_ENABLED: ${MCP_X_CACHE_ENABLED:-true}
       MCP_X_CACHE_PATH: /data/x-public.sqlite3
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
 
     volumes:
       - oauth-data:/data

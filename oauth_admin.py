@@ -52,11 +52,13 @@ def main():
         print("Password verified.")
     else:
         store = Store(args.database)
-        with store.transaction():
-            store.execute("UPDATE tokens SET revoked=1")
-            store.execute("UPDATE codes SET used=1")
-            store.execute("DELETE FROM pending")
-        store.close()
+        try:
+            with store.transaction():
+                store.execute("UPDATE tokens SET revoked=1")
+                store.execute("UPDATE codes SET used=1")
+                store.execute("DELETE FROM pending")
+        finally:
+            store.close()
         print("All OAuth grants revoked. The separately configured legacy bearer token is unchanged.")
 
 
