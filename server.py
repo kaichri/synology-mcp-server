@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import asyncio
 import json
+import logging
+import math
 import re
 import subprocess
 import time
@@ -11,6 +14,7 @@ from mcp.server import MCPServer
 from mcp import Client
 from youtube_transcript_api import YouTubeTranscriptApi
 from mcp.types import ToolAnnotations
+from requests import Session
 from exa_provider import Config as ExaConfig, ExaError, ExaRouter, RemoteExaMcpProvider, SearchRequest, render
 
 
@@ -29,6 +33,160 @@ mcp = MCPServer(
 
 EXA_MCP_URL = "https://mcp.exa.ai/mcp"
 TRANSCRIPT_MCP_URL = "https://youtube-transcript.ai/mcp"
+YOUTUBE_JOB_INTERVAL = 10
+YOUTUBE_QUEUE_TIMEOUT = 30
+YOUTUBE_TRANSCRIPT_TTL = 86400
+YOUTUBE_DIRECT = "www.youtube.com"
+YOUTUBE_TRANSCRIPT_SERVICE = urlparse(TRANSCRIPT_MCP_URL).hostname
+_youtube_lock = asyncio.Lock()
+_youtube_next_job = 0.0
+_youtube_cooldowns: dict[str, tuple[float, int]] = {}
+_transcript_cache: dict[tuple, tuple[float, str]] = {}
+_youtube_log = logging.getLogger("uvicorn.error.youtube")
+
+
+class YouTubeRateLimited(Exception):
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+
+
+def _youtube_rate_limit(error):
+    """Recognize HTTP errors and errors wrapped by the MCP/YouTube clients."""
+    pending = [error]
+    seen = set()
+    text_match = False
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        response = getattr(item, "response", None)
+        status = getattr(response, "status_code", getattr(item, "code", None))
+        if status == 429:
+            headers = getattr(response, "headers", getattr(item, "headers", None))
+            return YouTubeRateLimited(headers.get("Retry-After") if headers else None)
+        if isinstance(item, YouTubeRateLimited):
+            return item
+        if isinstance(item, BaseException):
+            pending.extend(e for e in (item.__cause__, item.__context__) if e is not None)
+            if isinstance(item, BaseExceptionGroup):
+                pending.extend(item.exceptions)
+        if re.search(r"\btoo many requests\b|\brate[ -]?limit(?:ed| exceeded)\b|"
+                     r"\b(?:HTTP(?: Error)?|status(?: code)?)\s*[:=]?\s*429\b|^429\b",
+                     str(item), re.I):
+            text_match = True
+    return YouTubeRateLimited() if text_match else None
+
+
+def _youtube_pause(route):
+    deadline, _ = _youtube_cooldowns.get(route, (0, 0))
+    seconds = math.ceil(deadline - time.monotonic())
+    if seconds > 0:
+        return f"YouTube retrieval paused for {route}. Retry in {seconds} seconds."
+    return None
+
+
+def _record_youtube_limit(route, stage, error):
+    _, streak = _youtube_cooldowns.get(route, (0, 0))
+    delay = (300, 900, 1800)[min(streak, 2)]
+    if error.retry_after:
+        try:
+            delay = max(1, int(error.retry_after))
+        except ValueError:
+            try:
+                deadline = parsedate_to_datetime(error.retry_after)
+                delay = max(1, math.ceil(deadline.timestamp() - time.time()))
+            except (ValueError, TypeError, OverflowError):
+                pass
+    _youtube_cooldowns[route] = (time.monotonic() + delay, streak + 1)
+    _youtube_log.warning("YouTube fetch limited: stage=%s route=%s status=429 cooldown_seconds=%s",
+                         stage, route, delay)
+    return _youtube_pause(route)
+
+
+class _YouTubeSession(Session):
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 15)
+        response = super().request(*args, **kwargs)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            response.close()
+            raise YouTubeRateLimited(retry_after)
+        return response
+
+
+async def _run_youtube_job(tool, work, route, cache_key=None):
+    global _youtube_next_job
+
+    queued_at = time.monotonic()
+    started_at = None
+    cache_status = "miss" if cache_key is not None else "not_applicable"
+    outcome = "error"
+
+    def cached():
+        entry = _transcript_cache.get(cache_key)
+        return entry[1] if entry and entry[0] > time.monotonic() else None
+
+    acquired = False
+    try:
+        if hit := cached():
+            cache_status = "hit"
+            outcome = "cached"
+            return hit
+        if pause := _youtube_pause(route):
+            outcome = "cooldown"
+            return pause
+        try:
+            async with asyncio.timeout(YOUTUBE_QUEUE_TIMEOUT):
+                await _youtube_lock.acquire()
+                acquired = True
+                if hit := cached():
+                    cache_status = "hit"
+                    outcome = "cached"
+                    return hit
+                if pause := _youtube_pause(route):
+                    outcome = "cooldown"
+                    return pause
+                await asyncio.sleep(max(0, _youtube_next_job - time.monotonic()))
+        except TimeoutError:
+            outcome = "queue_timeout"
+            return "YouTube queue busy. Retry later (30-second queue limit)."
+
+        async def run():
+            global _youtube_next_job
+            nonlocal started_at
+            started_at = time.monotonic()
+            try:
+                result, success = await work()
+                if success and cache_key is not None and len(result) <= 500_000:
+                    _transcript_cache.pop(cache_key, None)
+                    _transcript_cache[cache_key] = (time.monotonic() + YOUTUBE_TRANSCRIPT_TTL, result)
+                    while len(_transcript_cache) > 64:
+                        del _transcript_cache[next(iter(_transcript_cache))]
+                return result
+            finally:
+                _youtube_next_job = time.monotonic() + YOUTUBE_JOB_INTERVAL
+                _youtube_lock.release()
+
+        task = asyncio.create_task(run())
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        acquired = False  # The running job now owns the lock, even if its caller disconnects.
+        result = await asyncio.shield(task)
+        outcome = "returned"
+        return result
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        if acquired:
+            _youtube_lock.release()
+        finished_at = time.monotonic()
+        queue_end = finished_at if started_at is None else started_at
+        _youtube_log.info(
+            "YouTube tool: tool=%s outcome=%s queue_ms=%.0f fetch_ms=%.0f cache=%s",
+            tool, outcome, (queue_end - queued_at) * 1000,
+            (finished_at - queue_end) * 1000, cache_status,
+        )
 
 
 # ============================================================
@@ -387,6 +545,8 @@ def _fetch_sub_url(url: str, attempts: int = 2) -> str:
 
         except Exception as e:
 
+            if limit := _youtube_rate_limit(e):
+                raise limit from e
             last_error = e
 
             if attempt + 1 < attempts:
@@ -418,6 +578,9 @@ def _transcript_via_ytdlp(
             check=False,
             timeout=120,
         )
+
+        if limit := _youtube_rate_limit(result.stderr):
+            raise limit
 
         if result.returncode != 0:
 
@@ -453,6 +616,8 @@ def _transcript_via_ytdlp(
 
             except Exception as e:
 
+                if isinstance(e, YouTubeRateLimited):
+                    raise
                 last_error = f"{type(e).__name__}: {e}"
                 continue
 
@@ -481,6 +646,9 @@ def _transcript_via_ytdlp(
     except json.JSONDecodeError as e:
 
         return None, f"yt-dlp JSON error: {e}"
+
+    except YouTubeRateLimited:
+        raise
 
     except Exception as e:
 
@@ -1257,8 +1425,21 @@ async def finance_news_candidates(
 # ============================================================
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
-def youtube_metadata(url: str) -> str:
+async def youtube_metadata(url: str) -> str:
     """Get detailed YouTube metadata without downloading the video."""
+    return await _run_youtube_job(
+        "youtube_metadata", lambda: _youtube_ytdlp_job("metadata", _youtube_metadata, url),
+        YOUTUBE_DIRECT)
+
+
+async def _youtube_ytdlp_job(stage, function, *args):
+    try:
+        return await asyncio.to_thread(function, *args), False
+    except YouTubeRateLimited as error:
+        return _record_youtube_limit(YOUTUBE_DIRECT, stage, error), False
+
+
+def _youtube_metadata(url: str) -> str:
 
     try:
 
@@ -1276,6 +1457,9 @@ def youtube_metadata(url: str) -> str:
             check=False,
             timeout=120,
         )
+
+        if limit := _youtube_rate_limit(result.stderr):
+            raise limit
 
         if result.returncode != 0:
 
@@ -1321,6 +1505,9 @@ def youtube_metadata(url: str) -> str:
             separators=(",", ":")
         )
 
+    except YouTubeRateLimited:
+        raise
+
     except json.JSONDecodeError as e:
 
         return f"Metadata JSON error: {e}"
@@ -1351,7 +1538,12 @@ async def youtube_transcript(
         for x in languages.split(",")
         if x.strip()
     ]
+    return await _run_youtube_job(
+        "youtube_transcript", lambda: _retrieve_youtube_transcript(video_id, requested_languages),
+        YOUTUBE_TRANSCRIPT_SERVICE, (video_id, tuple(requested_languages)))
 
+
+async def _retrieve_youtube_transcript(video_id, requested_languages):
     # --------------------------------------------------------
     # Stage 1: public transcript MCP (keeps own IP clean)
     # --------------------------------------------------------
@@ -1365,11 +1557,9 @@ async def youtube_transcript(
             if lang:
                 arguments["lang"] = lang
 
-            remote = await call_mcp(
-                TRANSCRIPT_MCP_URL,
-                "get_youtube_transcript",
-                arguments
-            )
+            async with asyncio.timeout(20):
+                remote = await call_mcp(
+                    TRANSCRIPT_MCP_URL, "get_youtube_transcript", arguments)
 
             if re.search(
                 r"truncated at [\d,]+ characters",
@@ -1378,66 +1568,70 @@ async def youtube_transcript(
             ):
                 continue
 
-            if not _remote_transcript_failed(remote):
-                return remote
+            if re.match(r"\s*(?:error\b|429\b|too many requests\b|rate limit\b)", remote, re.I):
+                if limit := _youtube_rate_limit(remote[:500]):
+                    return _record_youtube_limit(YOUTUBE_TRANSCRIPT_SERVICE, "remote_transcript", limit), False
 
-        except Exception:
-            pass
+            if not _remote_transcript_failed(remote):
+                _youtube_cooldowns.pop(YOUTUBE_TRANSCRIPT_SERVICE, None)
+                return remote, True
+
+        except Exception as error:
+            if limit := _youtube_rate_limit(error):
+                return _record_youtube_limit(YOUTUBE_TRANSCRIPT_SERVICE, "remote_transcript", limit), False
 
     # --------------------------------------------------------
     # Stage 2: own fetch (previous behaviour)
     # --------------------------------------------------------
 
     stage2_error = ""
+    if pause := _youtube_pause(YOUTUBE_DIRECT):
+        return pause, False
 
-    try:
+    def fetch_direct():
+        with _YouTubeSession() as session:
+            api = YouTubeTranscriptApi(http_client=session)
+            fetched = api.list(video_id).find_transcript(requested_languages).fetch()
 
-        api = YouTubeTranscriptApi()
-
-        transcript_list = api.list(
-            video_id
-        )
-
-        transcript = transcript_list.find_transcript(
-            requested_languages
-        )
-
-        fetched = transcript.fetch()
-
-        formatted = _format_transcript_blocks(
+        return _format_transcript_blocks(
             [
                 (segment.start, segment.text)
                 for segment in fetched
             ]
         )
 
-        if formatted:
-            return formatted
+    try:
+        if formatted := await asyncio.to_thread(fetch_direct):
+            _youtube_cooldowns.pop(YOUTUBE_DIRECT, None)
+            return formatted, True
 
         stage2_error = "Transcript contains no usable text."
 
     except Exception as e:
 
+        if limit := _youtube_rate_limit(e):
+            return _record_youtube_limit(YOUTUBE_DIRECT, "direct_transcript", limit), False
         stage2_error = f"{type(e).__name__}: {e}"
 
     # --------------------------------------------------------
     # Stage 3: yt-dlp subtitles (last resort)
     # --------------------------------------------------------
 
-    transcript_text, stage3_error = await asyncio.to_thread(
-        _transcript_via_ytdlp,
-        video_id,
-        requested_languages,
-    )
+    try:
+        transcript_text, stage3_error = await asyncio.to_thread(
+            _transcript_via_ytdlp, video_id, requested_languages)
+    except YouTubeRateLimited as error:
+        return _record_youtube_limit(YOUTUBE_DIRECT, "yt_dlp_transcript", error), False
 
     if transcript_text:
-        return transcript_text
+        _youtube_cooldowns.pop(YOUTUBE_DIRECT, None)
+        return transcript_text, True
 
     return (
         f"Transcript error for {video_id}: "
         f"youtube-transcript-api: {stage2_error}; "
         f"yt-dlp: {stage3_error}"
-    )
+    ), False
 
 
 # ============================================================
@@ -1445,12 +1639,18 @@ async def youtube_transcript(
 # ============================================================
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
-def youtube_comments(
+async def youtube_comments(
     url: str,
     limit: int = 20,
     sort: str = "top"
 ) -> str:
     """Get YouTube comments in a compact format."""
+    return await _run_youtube_job(
+        "youtube_comments", lambda: _youtube_ytdlp_job("comments", _youtube_comments, url, limit, sort),
+        YOUTUBE_DIRECT)
+
+
+def _youtube_comments(url, limit, sort):
 
     limit = max(
         1,
@@ -1487,6 +1687,8 @@ def youtube_comments(
     except subprocess.CalledProcessError as e:
 
         error = (e.stderr or "").strip()
+        if rate_limit := _youtube_rate_limit(error):
+            raise rate_limit from e
 
         return (
             f"Comments error: {error}"
@@ -1494,6 +1696,8 @@ def youtube_comments(
             else "Comments could not be retrieved."
         )
 
+    if rate_limit := _youtube_rate_limit(result.stderr):
+        raise rate_limit
     output = result.stdout.strip()
 
     if not output:

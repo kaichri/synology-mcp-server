@@ -39,7 +39,7 @@ def test_web_search_and_fetch_contract(monkeypatch):
 def test_youtube_metadata_contract(monkeypatch):
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw:
                         SimpleNamespace(returncode=0, stdout=json.dumps({"id": "abc123", "title": "Video"}), stderr=""))
-    result = json.loads(server.youtube_metadata("https://youtu.be/abc123"))
+    result = json.loads(asyncio.run(server.youtube_metadata("https://youtu.be/abc123")))
     assert result["id"] == "abc123" and result["title"] == "Video"
 
 
